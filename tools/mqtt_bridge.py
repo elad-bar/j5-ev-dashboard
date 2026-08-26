@@ -2,11 +2,15 @@
 
 Runs inside the dashboard server process. Soft-depends on paho-mqtt — if enabled in creds
 but the package is missing, logs a clear error and stays idle.
+Topics are namespaced per car out of the box:
+  {base_topic}/{VIN|plate|vehicle_id}/sensor/battery
+so two Docker instances on one broker do not collide when base_topic is shared.
 """
 from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -33,7 +37,7 @@ DEFAULT_OPCODES = {
 }
 
 POLL_S = 2.5
-HEARTBEAT_S = 60.0
+HEARTBEAT_S = 30.0  # republish retained state at least this often; otherwise only on change
 ONLINE_AGE_MIN = 40.0
 BATTERY_LOW_PCT = 20
 
@@ -115,10 +119,20 @@ def _mqtt_cfg(raw=None):
         "username": (c.get("username") or "").strip(),
         "password": c.get("password") if c.get("password") is not None else "",
         "tls": bool(c.get("tls")),
+        # Prefix only — vehicle slug (VIN → plate → vehicle_id) is always appended.
         "base_topic": (c.get("base_topic") or "j5").strip().strip("/") or "j5",
         "discovery_prefix": (c.get("discovery_prefix") or "homeassistant").strip().strip("/")
                             or "homeassistant",
     }
+
+
+def _topic_slug(value):
+    """MQTT-safe segment from VIN / plate / id. Empty if missing or placeholder."""
+    s = str(value or "").strip()
+    if not s or s.lower() == "auto":
+        return ""
+    s = re.sub(r"[^A-Za-z0-9_-]+", "_", s).strip("_")
+    return s[:64]
 
 
 class MqttBridge:
@@ -132,7 +146,7 @@ class MqttBridge:
         self._last_error = None
         self._last_publish_ts = None
         self._discovery_sent = False
-        self._last_payload = None
+        self._last_pubs = {}  # topic -> last payload string (skip unchanged publishes)
         self._last_pub_mono = 0.0
         self._prev_charge_state = None
         self._prev_battery = None
@@ -153,7 +167,23 @@ class MqttBridge:
                 "last_error": self._last_error,
                 "last_publish_ts": self._last_publish_ts,
                 "has_paho": HAS_PAHO,
+                "topic_root": self._topic_root(),
+                "vehicle_slug": self._vehicle_slug(),
             }
+
+    def _vehicle_slug(self):
+        """Prefer VIN (stable, globally unique), then plate, then CarLinko vehicle_id."""
+        v = self.get_vehicle() or {}
+        for cand in (v.get("vin"), v.get("plate"), self.get_vehicle_id()):
+            s = _topic_slug(cand)
+            if s:
+                return s
+        return "car"
+
+    def _topic_root(self):
+        """Effective MQTT namespace: {base_topic}/{vehicle_slug}."""
+        base = (self._cfg.get("base_topic") or "j5").strip().strip("/") or "j5"
+        return f"{base}/{self._vehicle_slug()}"
 
     def start(self, mqtt_creds=None):
         self.reload(mqtt_creds)
@@ -175,7 +205,8 @@ class MqttBridge:
             self._teardown_client()
             self._cfg = cfg
             self._discovery_sent = False
-            self._last_payload = None
+            self._last_pubs = {}
+            self._last_pub_mono = 0.0
         t = self._thread
         if t and t.is_alive() and t is not threading.current_thread():
             t.join(timeout=5)
@@ -203,8 +234,8 @@ class MqttBridge:
         if not c:
             return
         try:
-            base = self._cfg.get("base_topic") or "j5"
-            c.publish(f"{base}/availability", "offline", qos=0, retain=True)
+            root = self._topic_root()
+            c.publish(f"{root}/availability", "offline", qos=0, retain=True)
         except Exception:
             pass
         try:
@@ -245,21 +276,23 @@ class MqttBridge:
         self._teardown_client()
 
     def _make_client(self, cfg):
+        root = self._topic_root()
+        # Include vehicle slug so two cars on one broker don't share a client_id.
+        cid = f"carlinko-{root}".replace("/", "-")
         # paho v1 vs v2 callback API
         try:
             client = mqtt.Client(
                 mqtt.CallbackAPIVersion.VERSION1,
-                client_id=f"carlinko-{cfg['base_topic']}",
+                client_id=cid,
                 clean_session=True,
             )
         except Exception:
-            client = mqtt.Client(client_id=f"carlinko-{cfg['base_topic']}", clean_session=True)
+            client = mqtt.Client(client_id=cid, clean_session=True)
         if cfg["username"]:
             client.username_pw_set(cfg["username"], cfg["password"] or None)
         if cfg["tls"]:
             client.tls_set()
-        base = cfg["base_topic"]
-        client.will_set(f"{base}/availability", "offline", qos=0, retain=True)
+        client.will_set(f"{root}/availability", "offline", qos=0, retain=True)
         client.on_connect = self._on_connect
         client.on_disconnect = self._on_disconnect
         client.on_message = self._on_message
@@ -273,12 +306,13 @@ class MqttBridge:
             print("mqtt_bridge:", self._last_error, flush=True)
             return
         self._last_error = None
-        base = self._cfg["base_topic"]
-        # Subscribe all command topics under base/control/+/set and nested climate/covers.
-        client.subscribe(f"{base}/control/#")
-        client.publish(f"{base}/availability", "online", qos=0, retain=True)
+        root = self._topic_root()
+        # Subscribe all command topics under root/control/# (lock, climate, covers, …).
+        client.subscribe(f"{root}/control/#")
+        client.publish(f"{root}/availability", "online", qos=0, retain=True)
         self._discovery_sent = False
-        print("mqtt_bridge: connected to", self._cfg["host"], flush=True)
+        print("mqtt_bridge: connected to", self._cfg["host"],
+              "topics under", root, flush=True)
 
     def _on_disconnect(self, client, userdata, rc, *args):
         self._connected = False
@@ -302,6 +336,16 @@ class MqttBridge:
             payload = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
         c.publish(topic, payload, qos=0, retain=retain)
 
+    def _pub_if_changed(self, topic, payload, retain=True, force=False):
+        """Publish retained state only when the payload changed (or force=heartbeat)."""
+        if not isinstance(payload, str):
+            payload = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+        if not force and self._last_pubs.get(topic) == payload:
+            return False
+        self._pub(topic, payload, retain=retain)
+        self._last_pubs[topic] = payload
+        return True
+
     def _device_info(self):
         v = self.get_vehicle() or {}
         vid = str(self.get_vehicle_id() or v.get("plate") or "car")
@@ -317,7 +361,7 @@ class MqttBridge:
     def _publish_discovery(self, caps):
         cfg = self._cfg
         pref = cfg["discovery_prefix"]
-        base = cfg["base_topic"]
+        base = self._topic_root()
         avail = {"topic": f"{base}/availability"}
         device = self._device_info()
         uniq = device["identifiers"][0]
@@ -457,10 +501,12 @@ class MqttBridge:
         if not self._discovery_sent:
             self._publish_discovery(caps)
 
+        base = self._topic_root()
         latest = self._read_latest()
         if not latest:
-            base = self._cfg["base_topic"]
-            self._pub(f"{base}/binary_sensor/online", "OFF")
+            # Avoid spamming HA every poll when the DB has no frame yet.
+            self._pub_if_changed(f"{base}/binary_sensor/online", "OFF")
+            self._pub_if_changed(f"{base}/availability", "offline", retain=True)
             return
         ts, dec = latest
         age_min = (time.time() - ts) / 60.0
@@ -480,41 +526,39 @@ class MqttBridge:
         trunk_open = bool(dec.get("trunk_open"))
         consumption = dec.get("consumption") or ""
 
-        snap = {
-            "battery": battery, "range": dec.get("range_km"), "odo": dec.get("odometer"),
-            "volt12": dec.get("volt12"), "rate": rate, "consumption": consumption,
-            "charging": charging, "online": online, "unlocked": unlocked, "ac_on": ac_on,
-            "ac_temp": ac_temp if temp_ok else None, "windows": windows_open,
-            "sunroof": sunroof_open, "trunk": trunk_open, "cstate": cstate,
-        }
-        now = time.monotonic()
-        changed = snap != self._last_payload
-        due = (now - self._last_pub_mono) >= HEARTBEAT_S
-        if not changed and not due:
-            return
-
-        base = self._cfg["base_topic"]
         def n(v):
             return "" if v is None else str(v)
 
-        self._pub(f"{base}/sensor/battery", n(battery))
-        self._pub(f"{base}/sensor/range", n(dec.get("range_km")))
-        self._pub(f"{base}/sensor/odometer", n(dec.get("odometer")))
-        self._pub(f"{base}/sensor/volt12", n(dec.get("volt12")))
-        self._pub(f"{base}/sensor/charge_power", n(rate))
-        self._pub(f"{base}/sensor/consumption", n(consumption) if consumption else "")
-        self._pub(f"{base}/binary_sensor/charging", "ON" if charging else "OFF")
-        self._pub(f"{base}/binary_sensor/online", "ON" if online else "OFF")
-        self._pub(f"{base}/lock/state", "UNLOCKED" if unlocked else "LOCKED")
-        self._pub(f"{base}/climate/mode", "cool" if ac_on else "off")
-        self._pub(f"{base}/climate/action", "cooling" if ac_on else "off")
-        self._pub(f"{base}/climate/temperature", n(ac_temp) if temp_ok else "")
-        self._pub(f"{base}/cover/windows/state", "open" if windows_open else "closed")
-        self._pub(f"{base}/cover/sunroof/state", "open" if sunroof_open else "closed")
-        self._pub(f"{base}/cover/liftgate/state", "open" if trunk_open else "closed")
-        self._pub(f"{base}/availability", "online" if online else "offline", retain=True)
+        pubs = {
+            f"{base}/sensor/battery": n(battery),
+            f"{base}/sensor/range": n(dec.get("range_km")),
+            f"{base}/sensor/odometer": n(dec.get("odometer")),
+            f"{base}/sensor/volt12": n(dec.get("volt12")),
+            f"{base}/sensor/charge_power": n(rate),
+            f"{base}/sensor/consumption": n(consumption) if consumption else "",
+            f"{base}/binary_sensor/charging": "ON" if charging else "OFF",
+            f"{base}/binary_sensor/online": "ON" if online else "OFF",
+            f"{base}/lock/state": "UNLOCKED" if unlocked else "LOCKED",
+            f"{base}/climate/mode": "cool" if ac_on else "off",
+            f"{base}/climate/action": "cooling" if ac_on else "off",
+            f"{base}/climate/temperature": n(ac_temp) if temp_ok else "",
+            f"{base}/cover/windows/state": "open" if windows_open else "closed",
+            f"{base}/cover/sunroof/state": "open" if sunroof_open else "closed",
+            f"{base}/cover/liftgate/state": "open" if trunk_open else "closed",
+            f"{base}/availability": "online" if online else "offline",
+        }
 
-        # Edge events (not retained)
+        now = time.monotonic()
+        due = (now - self._last_pub_mono) >= HEARTBEAT_S
+        any_changed = any(self._last_pubs.get(t) != p for t, p in pubs.items())
+        if any_changed or due:
+            # On change: only the topics that differ. On heartbeat: refresh all retained state.
+            for topic, payload in pubs.items():
+                self._pub_if_changed(topic, payload, retain=True, force=due)
+            self._last_pub_mono = now
+            self._last_publish_ts = int(time.time())
+
+        # Edge events (non-retained) — real transitions only, never on heartbeat alone.
         if self._prev_charge_state == 1 and cstate == 2:
             self._pub(f"{base}/event/charge_complete",
                       {"battery": battery, "ts": int(time.time())}, retain=False)
@@ -528,9 +572,6 @@ class MqttBridge:
 
         self._prev_charge_state = cstate
         self._prev_battery = battery
-        self._last_payload = snap
-        self._last_pub_mono = now
-        self._last_publish_ts = int(time.time())
 
     def _fire_action(self, action_key):
         """Init 77 then fire mapped opcode. Returns result dict."""
@@ -549,11 +590,11 @@ class MqttBridge:
                 "ts": int(time.time())}
 
     def _ack(self, result):
-        base = self._cfg["base_topic"]
+        base = self._topic_root()
         self._pub(f"{base}/control/result", result, retain=False)
 
     def _handle_command(self, topic, payload):
-        base = self._cfg["base_topic"]
+        base = self._topic_root()
         prefix = f"{base}/control/"
         if not topic.startswith(prefix) or not topic.endswith("/set"):
             return
