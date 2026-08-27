@@ -372,7 +372,6 @@ CAP_SOURCE = ("creds" if _CC.get("battery_kwh") else
               "known" if KNOWN.get("battery_kwh") else "guess")
 WLTP_KWH_100 = float(_CC.get("wltp_kwh_100") or KNOWN.get("wltp_kwh_100") or 14.8)  # "optimal" baseline
 WLTP_KNOWN = bool(_CC.get("wltp_kwh_100") or KNOWN.get("wltp_kwh_100"))
-TARIFF_IDR_CFG = _CC.get("tariff_idr") or _CC.get("tariff")   # local all-in tariff/kWh override (optional)
 # --- currency + tyre-unit (open to non-Indonesia cars; default to the J5/IDR values this was calibrated on) ---
 _CUR       = _CC.get("currency") or {}
 CUR_SYMBOL = _CUR.get("symbol") or "Rp"                # display symbol, e.g. "R" (ZAR), "$", "€"
@@ -431,9 +430,63 @@ BALANCE_DAYS = float(_CC.get("full_charge_days") or (7 if CHEMISTRY == "lfp" els
 IDLE_GAP = 1800         # parked + no SoC rise for 30 min => charge session ended
 CHARGE_PARK_MIN = 600   # a real charge sits odo-flat >=10 min; regen blips (odo coarse=1km) don't
 MIN_GAIN_PCT = 2        # net SoC gain floor; drops 1% regen/noise that survives the park gate
-_TARIFF = float(TARIFF_IDR_CFG or 2540)   # all-in DC tariff/kWh, in CUR_CODE (IDR default: Rp2.467 + 3% tax; service Rp0)
-TARIFF_IDR = int(_TARIFF) if _TARIFF == int(_TARIFF) else _TARIFF  # keep cents for decimal currencies (e.g. ZAR 3.10)
 CHG_EFF_AVG = 0.89      # blended DC charge efficiency for the per-km cost insight
+# Cost/compare setpoints — reloaded from creds.json when HA MQTT number entities change.
+TARIFF_IDR = 2540
+PETROL_KM_L = 12.0
+PETROL_RP_L = 16250.0
+_summary_cache = {"key": None, "out": None}
+
+def apply_cost_config(creds=None):
+    """Load tariff / petrol compare rates. Called at import and after MQTT number commands."""
+    global TARIFF_IDR, PETROL_KM_L, PETROL_RP_L
+    c = creds if isinstance(creds, dict) else _creds()
+    raw = c.get("tariff")
+    if raw is None:
+        raw = c.get("tariff_idr")
+    t = float(raw if raw is not None else 2540)
+    TARIFF_IDR = int(t) if t == int(t) else t
+    PETROL_KM_L = float(c.get("petrol_kml") or 12.0)
+    PETROL_RP_L = float(c.get("petrol_price") or 16250)
+    _summary_cache["key"] = None
+
+def get_cost_config():
+    return {
+        "tariff": TARIFF_IDR,
+        "petrol_price": PETROL_RP_L,
+        "petrol_kml": PETROL_KM_L,
+        "currency": {"symbol": CUR_SYMBOL, "locale": CUR_LOCALE, "code": CUR_CODE},
+    }
+
+def set_cost_config(key, value):
+    """Persist a HA number setpoint to creds.json and reload in-memory rates."""
+    if key not in ("tariff", "petrol_price", "petrol_kml"):
+        return {"ok": False, "error": "unknown key"}
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "not a number"}
+    if v < 0:
+        return {"ok": False, "error": "negative"}
+    maxes = {"tariff": 1e7, "petrol_price": 1e7, "petrol_kml": 100}
+    if v > maxes[key]:
+        return {"ok": False, "error": "out of range"}
+    if key == "petrol_kml" and v == 0:
+        return {"ok": False, "error": "petrol_kml must be > 0"}
+    c = _creds()
+    stored = int(v) if v == int(v) else v
+    if key == "tariff":
+        c["tariff"] = stored
+        c.pop("tariff_idr", None)
+    elif key == "petrol_price":
+        c["petrol_price"] = stored
+    else:
+        c["petrol_kml"] = stored
+    _save_creds(c)
+    apply_cost_config(c)
+    return {"ok": True, "key": key, "value": get_cost_config()[key]}
+
+apply_cost_config(_CC)
 
 def chg_eff(soc_end):
     """DC charge efficiency = stored SoC kWh / delivered (metered) kWh. Drops when topping to
@@ -455,10 +508,6 @@ ODO_RESYNC_KM = 12      # a frame pair advancing more than this is a late cloud 
                         # some unknown earlier time, so they can't be dated to a day/trip -- skip the
                         # pair (the lifetime odo span still includes them). Real driving is ticked in
                         # ~1 km steps, so the largest genuine batch seen is ~11 km.
-PETROL_KM_L = float(_CC.get("petrol_kml") or 12.0)        # comparable ICE fuel economy (km per litre)
-PETROL_RP_L = float(_CC.get("petrol_price") or 16250)     # petrol price /litre in CUR_CODE
-                                                          # (IDR default: Pertamax, Jawa/Bali, 1 Jul 2026)
-
 def _m(x):
     # round money: whole units at IDR scale (>=100), keep 2 dp for sub-unit currencies (e.g. ZAR /km)
     return round(x) if abs(x) >= 100 else round(x, 2)
@@ -798,7 +847,9 @@ def demo_summary():
         "unlocked": False, "speed": None, "moving": False, "avg_speed": 41,
         "ac_on": False, "ac_temp_c": 22, "doors": 0, "trunk_open": False,
         "windows": 0, "sunroof_open": False,
-        "updated": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now - 180)), "age_min": 3.0,
+        "seat_heat": [0, 0], "seat_vent": [0, 0], "defrost_front": False, "hv_state": 0,
+        "updated": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now - 180)),
+        "updated_ts": int(now - 180), "age_min": 3.0,
         "battery_kwh": cap, "battery_kwh_source": "known", "wltp_kwh_100": 14.8,
         "chemistry_known": True, "powertrain": "bev", "fuel": None,
             "currency": {"symbol": CUR_SYMBOL, "locale": CUR_LOCALE, "code": CUR_CODE},
@@ -836,16 +887,38 @@ def demo_summary():
     lf["saved"] = max(0, round(lf["km"] * (PETROL_RP_L / PETROL_KM_L - out["insights"].get("rp_per_km", 0))))
     return out
 
+def _latest_telemetry_ts():
+    if not os.path.exists(DB):
+        return None
+    conn = sqlite3.connect(DB)
+    try:
+        row = conn.execute(
+            "SELECT MAX(ts) FROM telemetry WHERE online=1 AND raw IS NOT NULL"
+        ).fetchone()
+    finally:
+        conn.close()
+    return row[0] if row and row[0] else None
+
 def summary():
     if DEMO:
         return demo_summary()
+    cache_key = (_latest_telemetry_ts(), TARIFF_IDR, PETROL_RP_L, PETROL_KM_L)
+    if _summary_cache["key"] == cache_key and _summary_cache["out"] is not None:
+        return _summary_cache["out"]
+    out = _build_summary()
+    _summary_cache["key"] = cache_key
+    _summary_cache["out"] = out
+    return out
+
+def _build_summary():
     out = {"vehicle": VEHICLE, "online": False, "battery": None, "range_km": None,
            "odometer": None, "volt12": None, "unlocked": None, "speed": None,
            "ac_on": None, "ac_temp_c": None, "doors": None, "trunk_open": None,
            "windows": None, "sunroof_open": None,
+           "seat_heat": None, "seat_vent": None, "defrost_front": None, "hv_state": None,
            "moving": False, "avg_speed": None, "insights": {}, "health": {}, "drain": None,
            "volt12_min7d": None, "volt12_status": None,
-           "updated": None, "age_min": None,
+           "updated": None, "updated_ts": None, "age_min": None,
            "battery_kwh": CAP_KWH, "battery_kwh_source": CAP_SOURCE,
            "wltp_kwh_100": WLTP_KWH_100 if WLTP_KNOWN else None,
            "chemistry_known": CHEMISTRY_KNOWN, "powertrain": "bev", "fuel": None,
@@ -880,7 +953,7 @@ def summary():
     ts, dt, dec = data[-1]
     out.update(battery=dec.get("battery"), range_km=dec.get("range_km"),
                odometer=dec.get("odometer"), volt12=dec.get("volt12"),
-               unlocked=dec.get("unlocked"), speed=None, updated=dt)
+               unlocked=dec.get("unlocked"), speed=None, updated=dt, updated_ts=ts)
     # Body / climate bytes (decoded in decode(); lock verified on J5+E5, A/C+doors+windows
     # live-verified on E5 #5 — surfaced for REST + MQTT so HA can use real state).
     out["ac_on"] = bool(dec.get("ac_on"))
@@ -890,6 +963,11 @@ def summary():
     out["sunroof_open"] = bool(dec.get("sunroof_open")) if dec.get("sunroof_open") is not None else None
     ac_temp = dec.get("ac_temp_c")
     out["ac_temp_c"] = ac_temp if (isinstance(ac_temp, int) and 16 <= ac_temp <= 30) else None
+    sh, sv = dec.get("seat_heat"), dec.get("seat_vent")
+    out["seat_heat"] = list(sh) if isinstance(sh, (list, tuple)) and len(sh) >= 2 else None
+    out["seat_vent"] = list(sv) if isinstance(sv, (list, tuple)) and len(sv) >= 2 else None
+    out["defrost_front"] = bool(dec.get("defrost_front")) if dec.get("defrost_front") is not None else None
+    out["hv_state"] = dec.get("hv_state")
     out["age_min"] = round((time.time() - ts) / 60, 1)
     out["online"] = out["age_min"] is not None and out["age_min"] < 40
     # Fuel side of a PHEV. Decided over the whole window, not the latest frame, so a car sitting at
@@ -1776,6 +1854,9 @@ def _start_mqtt_bridge():
         MB.bridge.send_control = send_control
         MB.bridge.get_vehicle = lambda: dict(VEHICLE)
         MB.bridge.get_vehicle_id = lambda: str((_creds().get("vehicle_id") or ""))
+        MB.bridge.get_summary = summary
+        MB.bridge.get_cost_config = get_cost_config
+        MB.bridge.set_cost_config = set_cost_config
         m = _creds().get("mqtt") if isinstance(_creds().get("mqtt"), dict) else {}
         MB.bridge.start(m)
     except Exception as e:

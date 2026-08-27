@@ -1,7 +1,7 @@
 """Home Assistant MQTT bridge: discovery, telemetry publish, named remote-control commands.
 
-Runs inside the dashboard server process. Soft-depends on paho-mqtt — if enabled in creds
-but the package is missing, logs a clear error and stays idle.
+Runs inside the dashboard server process. Needs paho-mqtt (requirements.txt); server.py imports
+this module lazily inside try/except, so the dashboard still serves if it is missing.
 Topics are namespaced per car out of the box:
   {base_topic}/{VIN|plate|vehicle_id}/sensor/battery
 so two Docker instances on one broker do not collide when base_topic is shared.
@@ -11,10 +11,12 @@ from __future__ import annotations
 import json
 import os
 import re
-import sqlite3
 import threading
 import time
 import traceback
+from datetime import datetime
+
+import paho.mqtt.client as mqtt
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 _DATA = os.environ.get("CARLINKO_DATA") or HERE
@@ -40,13 +42,15 @@ POLL_S = 2.5
 HEARTBEAT_S = 30.0  # republish retained state at least this often; otherwise only on change
 ONLINE_AGE_MIN = 40.0
 BATTERY_LOW_PCT = 20
-
-try:
-    import paho.mqtt.client as mqtt
-    HAS_PAHO = True
-except ImportError:
-    mqtt = None
-    HAS_PAHO = False
+CHARGE_STATE = {0: "idle", 1: "charging", 2: "complete", 3: "canceled", 4: "hot", 5: "stop"}
+HV_STATE = {0: "off", 1: "lv", 2: "ready"}
+TYRE_POS = (("fl", "Front left"), ("fr", "Front right"), ("rl", "Rear left"), ("rr", "Rear right"))
+DOOR_BITS = (
+    ("door_driver", "Driver door", 1),
+    ("door_passenger", "Passenger door", 2),
+    ("door_rear_left", "Rear left door", 4),
+    ("door_rear_right", "Rear right door", 8),
+)
 
 
 def opcodes_path():
@@ -135,6 +139,37 @@ def _topic_slug(value):
     return s[:64]
 
 
+def _n(v):
+    return "" if v is None else str(v)
+
+
+def _on(flag):
+    return "ON" if flag else "OFF"
+
+
+def _iso(ts):
+    try:
+        return datetime.fromtimestamp(float(ts)).astimezone().isoformat()
+    except Exception:
+        return ""
+
+
+def _money_step(code, sample):
+    if str(code or "").upper() == "IDR":
+        return 1
+    try:
+        if abs(float(sample or 0)) >= 100:
+            return 1
+    except Exception:
+        pass
+    return 0.01
+
+
+def _pressure_unit(unit):
+    u = (unit or "psi").lower()
+    return {"psi": "psi", "bar": "bar", "kpa": "kPa"}.get(u, "psi")
+
+
 class MqttBridge:
     def __init__(self):
         self._lock = threading.RLock()
@@ -146,6 +181,7 @@ class MqttBridge:
         self._last_error = None
         self._last_publish_ts = None
         self._discovery_sent = False
+        self._disc_fp = None
         self._last_pubs = {}  # topic -> last payload string (skip unchanged publishes)
         self._last_pub_mono = 0.0
         self._prev_charge_state = None
@@ -158,6 +194,9 @@ class MqttBridge:
         self.send_control = None
         self.get_vehicle = lambda: {}
         self.get_vehicle_id = lambda: ""
+        self.get_summary = None
+        self.get_cost_config = lambda: {}
+        self.set_cost_config = None
 
     def status(self):
         with self._lock:
@@ -166,7 +205,6 @@ class MqttBridge:
                 "connected": self._connected,
                 "last_error": self._last_error,
                 "last_publish_ts": self._last_publish_ts,
-                "has_paho": HAS_PAHO,
                 "topic_root": self._topic_root(),
                 "vehicle_slug": self._vehicle_slug(),
             }
@@ -205,6 +243,7 @@ class MqttBridge:
             self._teardown_client()
             self._cfg = cfg
             self._discovery_sent = False
+            self._disc_fp = None
             self._last_pubs = {}
             self._last_pub_mono = 0.0
         t = self._thread
@@ -215,10 +254,6 @@ class MqttBridge:
         if not cfg["enabled"]:
             self._connected = False
             self._last_error = None
-            return
-        if not HAS_PAHO:
-            self._last_error = "paho-mqtt not installed (pip install paho-mqtt)"
-            print("mqtt_bridge:", self._last_error, flush=True)
             return
         if not cfg["host"]:
             self._last_error = "mqtt.host is empty"
@@ -358,13 +393,21 @@ class MqttBridge:
             "suggested_area": "Garage",
         }
 
-    def _publish_discovery(self, caps):
+    def _publish_discovery(self, caps, out=None, cost=None):
         cfg = self._cfg
         pref = cfg["discovery_prefix"]
         base = self._topic_root()
         avail = {"topic": f"{base}/availability"}
         device = self._device_info()
         uniq = device["identifiers"][0]
+        out = out or {}
+        cost = cost or {}
+        cur = (out.get("currency") or cost.get("currency") or {})
+        code = (cur.get("code") or "IDR").upper()
+        phev = out.get("powertrain") == "phev"
+        direct_tpms = out.get("tyre_indirect") is False
+        pun = _pressure_unit(out.get("tyre_unit"))
+        step = _money_step(code, cost.get("tariff") if cost.get("tariff") is not None else out.get("tariff"))
 
         def disc(component, object_id, body):
             body = dict(body)
@@ -374,41 +417,229 @@ class MqttBridge:
             body.setdefault("object_id", object_id)
             self._pub(f"{pref}/{component}/{uniq}/{object_id}/config", body, retain=True)
 
-        # Sensors
-        disc("sensor", "battery", {
-            "name": "Battery", "state_topic": f"{base}/sensor/battery",
+        def sensor(oid, name, topic, extra):
+            body = {"name": name, "state_topic": f"{base}/{topic}"}
+            body.update(extra)
+            disc("sensor", oid, body)
+
+        def binary(oid, name, topic, extra=None):
+            body = {
+                "name": name, "state_topic": f"{base}/{topic}",
+                "payload_on": "ON", "payload_off": "OFF",
+            }
+            if extra:
+                body.update(extra)
+            disc("binary_sensor", oid, body)
+
+        sensor("battery", "Battery", "sensor/battery", {
             "unit_of_measurement": "%", "device_class": "battery", "state_class": "measurement",
         })
-        disc("sensor", "range", {
-            "name": "Range", "state_topic": f"{base}/sensor/range",
+        sensor("range", "Range", "sensor/range", {
             "unit_of_measurement": "km", "icon": "mdi:map-marker-distance",
             "state_class": "measurement",
         })
-        disc("sensor", "odometer", {
-            "name": "Odometer", "state_topic": f"{base}/sensor/odometer",
-            "unit_of_measurement": "km", "icon": "mdi:counter",
-            "state_class": "total_increasing",
+        sensor("odometer", "Odometer", "sensor/odometer", {
+            "unit_of_measurement": "km", "icon": "mdi:counter", "state_class": "total_increasing",
         })
-        disc("sensor", "volt12", {
-            "name": "12V Battery", "state_topic": f"{base}/sensor/volt12",
+        sensor("volt12", "12V Battery", "sensor/volt12", {
             "unit_of_measurement": "V", "device_class": "voltage", "state_class": "measurement",
         })
-        disc("sensor", "charge_power", {
-            "name": "Charge Power", "state_topic": f"{base}/sensor/charge_power",
+        sensor("charge_power", "Charge Power", "sensor/charge_power", {
             "unit_of_measurement": "kW", "device_class": "power", "state_class": "measurement",
         })
-        disc("sensor", "consumption", {
-            "name": "Consumption", "state_topic": f"{base}/sensor/consumption",
+        sensor("consumption", "Consumption", "sensor/consumption", {
             "unit_of_measurement": "kWh/100km", "icon": "mdi:lightning-bolt",
             "state_class": "measurement",
         })
-        disc("binary_sensor", "charging", {
-            "name": "Charging", "state_topic": f"{base}/binary_sensor/charging",
-            "payload_on": "ON", "payload_off": "OFF", "device_class": "battery_charging",
+        binary("charging", "Charging", "binary_sensor/charging", {"device_class": "battery_charging"})
+        binary("online", "Online", "binary_sensor/online", {"device_class": "connectivity"})
+
+        sensor("charge_remaining", "Charge remaining", "sensor/charge_remaining", {
+            "unit_of_measurement": "min", "device_class": "duration", "state_class": "measurement",
         })
-        disc("binary_sensor", "online", {
-            "name": "Online", "state_topic": f"{base}/binary_sensor/online",
-            "payload_on": "ON", "payload_off": "OFF", "device_class": "connectivity",
+        sensor("charge_mode", "Charge mode", "sensor/charge_mode", {
+            "device_class": "enum", "options": ["none", "ac", "dc"], "icon": "mdi:ev-plug-type2",
+        })
+        sensor("charge_state", "Charge state", "sensor/charge_state", {
+            "device_class": "enum",
+            "options": ["idle", "charging", "complete", "canceled", "hot", "stop"],
+        })
+        sensor("charge_session_kwh", "Charge session", "sensor/charge_session_kwh", {
+            "unit_of_measurement": "kWh", "device_class": "energy", "state_class": "measurement",
+        })
+        sensor("charge_session_soc", "Charge session SoC", "sensor/charge_session_soc", {
+            "unit_of_measurement": "%", "device_class": "battery", "state_class": "measurement",
+        })
+        binary("moving", "Moving", "binary_sensor/moving", {"device_class": "moving"})
+        sensor("updated", "Updated", "sensor/updated", {"device_class": "timestamp"})
+
+        if phev:
+            sensor("fuel", "Fuel", "sensor/fuel", {
+                "unit_of_measurement": "%", "icon": "mdi:gas-station", "state_class": "measurement",
+            })
+            sensor("fuel_range", "Fuel range", "sensor/fuel_range", {
+                "unit_of_measurement": "km", "icon": "mdi:map-marker-distance",
+                "state_class": "measurement",
+            })
+            sensor("total_range", "Total range", "sensor/total_range", {
+                "unit_of_measurement": "km", "icon": "mdi:map-marker-distance",
+                "state_class": "measurement",
+            })
+            sensor("fuel_consumption", "Fuel consumption", "sensor/fuel_consumption", {
+                "unit_of_measurement": "L/100km", "icon": "mdi:fuel", "state_class": "measurement",
+            })
+
+        sensor("tyre_status", "Tyre status", "sensor/tyre_status", {
+            "device_class": "enum", "options": ["Normal", "Check tyres"], "icon": "mdi:car-tire-alert",
+        })
+        binary("tyres_ok", "Tyre problem", "binary_sensor/tyres_ok", {"device_class": "problem"})
+        if direct_tpms:
+            for oid, label in TYRE_POS:
+                sensor(f"tyre_{oid}", label, f"sensor/tyre_{oid}", {
+                    "unit_of_measurement": pun, "device_class": "pressure", "state_class": "measurement",
+                })
+                sensor(f"tyre_{oid}_temp", f"{label} temp", f"sensor/tyre_{oid}_temp", {
+                    "unit_of_measurement": "°C", "device_class": "temperature",
+                    "state_class": "measurement",
+                })
+
+        binary("door", "Any door", "binary_sensor/door", {"device_class": "door"})
+        for oid, label, _bit in DOOR_BITS:
+            binary(oid, label, f"binary_sensor/{oid}", {"device_class": "door"})
+        binary("seat_heat_left", "Seat heat left", "binary_sensor/seat_heat_left",
+               {"device_class": "heat"})
+        binary("seat_heat_right", "Seat heat right", "binary_sensor/seat_heat_right",
+               {"device_class": "heat"})
+        binary("seat_vent_left", "Seat vent left", "binary_sensor/seat_vent_left",
+               {"icon": "mdi:car-seat"})
+        binary("seat_vent_right", "Seat vent right", "binary_sensor/seat_vent_right",
+               {"icon": "mdi:car-seat"})
+        binary("defrost", "Defrost", "binary_sensor/defrost", {"icon": "mdi:car-defrost-front"})
+        sensor("hv_state", "HV state", "sensor/hv_state", {
+            "device_class": "enum", "options": ["off", "lv", "ready", "unknown"],
+            "icon": "mdi:car-electric",
+        })
+        sensor("volt12_status", "12V status", "sensor/volt12_status", {
+            "device_class": "enum", "options": ["ok", "low", "critical"],
+        })
+        sensor("volt12_min7d", "12V 7-day min", "sensor/volt12_min7d", {
+            "unit_of_measurement": "V", "device_class": "voltage", "state_class": "measurement",
+        })
+        sensor("wltc_range", "Rated range", "sensor/wltc_range", {
+            "unit_of_measurement": "km", "icon": "mdi:map-marker-distance",
+            "state_class": "measurement",
+        })
+        sensor("parked_drain", "Parked drain", "sensor/parked_drain", {
+            "unit_of_measurement": "%/d", "icon": "mdi:battery-minus", "state_class": "measurement",
+        })
+
+        sensor("km_today", "Km today", "sensor/km_today", {
+            "unit_of_measurement": "km", "state_class": "measurement", "icon": "mdi:road-variant",
+        })
+        sensor("km_week", "Km week", "sensor/km_week", {
+            "unit_of_measurement": "km", "state_class": "measurement", "icon": "mdi:road-variant",
+        })
+        sensor("km_month", "Km month", "sensor/km_month", {
+            "unit_of_measurement": "km", "state_class": "measurement", "icon": "mdi:road-variant",
+        })
+        sensor("energy_today", "Energy today", "sensor/energy_today", {
+            "unit_of_measurement": "kWh", "device_class": "energy", "state_class": "measurement",
+        })
+        sensor("energy_left", "Energy left", "sensor/energy_left", {
+            "unit_of_measurement": "kWh", "device_class": "energy", "state_class": "measurement",
+        })
+        sensor("efficiency_rating", "Efficiency rating", "sensor/efficiency_rating", {
+            "device_class": "enum", "options": ["optimal", "normal", "boros"],
+        })
+        sensor("avg_speed", "Average speed", "sensor/avg_speed", {
+            "unit_of_measurement": "km/h", "device_class": "speed", "state_class": "measurement",
+        })
+
+        sensor("charges_week", "Charges this week", "sensor/charges_week", {
+            "state_class": "measurement", "icon": "mdi:ev-station",
+        })
+        sensor("charges_month", "Charges this month", "sensor/charges_month", {
+            "state_class": "measurement", "icon": "mdi:ev-station",
+        })
+        sensor("charge_month_kwh", "Charge kWh this month", "sensor/charge_month_kwh", {
+            "unit_of_measurement": "kWh", "device_class": "energy", "state_class": "measurement",
+        })
+        sensor("charge_month_cost", "Charge cost this month", "sensor/charge_month_cost", {
+            "unit_of_measurement": code, "device_class": "monetary", "state_class": "total",
+            "icon": "mdi:cash",
+        })
+
+        sensor("lifetime_km", "Lifetime km", "sensor/lifetime_km", {
+            "unit_of_measurement": "km", "state_class": "total_increasing", "icon": "mdi:counter",
+        })
+        sensor("lifetime_kwh", "Lifetime kWh billed", "sensor/lifetime_kwh", {
+            "unit_of_measurement": "kWh", "device_class": "energy", "state_class": "total_increasing",
+        })
+        sensor("lifetime_cost", "Lifetime cost", "sensor/lifetime_cost", {
+            "unit_of_measurement": code, "device_class": "monetary", "state_class": "total",
+        })
+        sensor("lifetime_saved", "Lifetime saved", "sensor/lifetime_saved", {
+            "unit_of_measurement": code, "device_class": "monetary", "state_class": "total",
+        })
+        sensor("liters_saved", "Litres saved", "sensor/liters_saved", {
+            "unit_of_measurement": "L", "state_class": "total", "icon": "mdi:gas-station-off",
+        })
+        sensor("co2_saved", "CO2 saved", "sensor/co2_saved", {
+            "unit_of_measurement": "kg", "device_class": "weight", "state_class": "total",
+        })
+
+        sensor("running_cost", "Running cost", "sensor/running_cost", {
+            "unit_of_measurement": f"{code}/km", "icon": "mdi:cash", "state_class": "measurement",
+        })
+        sensor("month_cost_est", "Month cost estimate", "sensor/month_cost_est", {
+            "unit_of_measurement": code, "device_class": "monetary", "state_class": "total",
+        })
+        sensor("days_to_charge", "Days to charge", "sensor/days_to_charge", {
+            "unit_of_measurement": "d", "icon": "mdi:calendar-clock", "state_class": "measurement",
+        })
+        sensor("real_range", "Real-world range", "sensor/real_range", {
+            "unit_of_measurement": "km", "icon": "mdi:map-marker-distance",
+            "state_class": "measurement",
+        })
+        sensor("rated_range", "Car-rated range", "sensor/rated_range", {
+            "unit_of_measurement": "km", "icon": "mdi:map-marker-distance",
+            "state_class": "measurement",
+        })
+        sensor("battery_usable", "Usable battery", "sensor/battery_usable", {
+            "unit_of_measurement": "kWh", "device_class": "energy", "state_class": "measurement",
+        })
+        sensor("battery_cycles", "Battery cycles", "sensor/battery_cycles", {
+            "state_class": "measurement", "icon": "mdi:battery-sync",
+        })
+        sensor("days_since_full", "Days since full charge", "sensor/days_since_full", {
+            "unit_of_measurement": "d", "icon": "mdi:battery-charging-100",
+            "state_class": "measurement",
+        })
+        sensor("battery_care", "Battery care", "sensor/battery_care", {
+            "device_class": "enum", "options": ["ok", "due", "overdue", "unknown"],
+        })
+        binary("balance_due", "Balance due", "binary_sensor/balance_due")
+
+        disc("number", "tariff", {
+            "name": "Charging tariff",
+            "state_topic": f"{base}/number/tariff",
+            "command_topic": f"{base}/control/tariff/set",
+            "min": 0, "max": 10000000, "step": step, "mode": "box",
+            "unit_of_measurement": f"{code}/kWh", "icon": "mdi:currency-usd",
+        })
+        disc("number", "petrol_price", {
+            "name": "Petrol price",
+            "state_topic": f"{base}/number/petrol_price",
+            "command_topic": f"{base}/control/petrol_price/set",
+            "min": 0, "max": 10000000, "step": step, "mode": "box",
+            "unit_of_measurement": f"{code}/L", "icon": "mdi:gas-station",
+        })
+        disc("number", "petrol_kml", {
+            "name": "Petrol economy",
+            "state_topic": f"{base}/number/petrol_kml",
+            "command_topic": f"{base}/control/petrol_kml/set",
+            "min": 0.1, "max": 100, "step": 0.1, "mode": "box",
+            "unit_of_measurement": "km/L", "icon": "mdi:car-speed-limiter",
         })
 
         caps = caps or {}
@@ -473,23 +704,137 @@ class MqttBridge:
                 "payload_press": "PRESS",
             })
         self._discovery_sent = True
+        self._disc_fp = (phev, direct_tpms, code, step)
 
-    def _read_latest(self):
-        db = self.get_db_path()
-        if not db or not os.path.exists(db) or not self.decode:
-            return None
-        conn = sqlite3.connect(db)
+    def _disc_fingerprint(self, out, cost):
+        out = out or {}
+        cost = cost or {}
+        cur = (out.get("currency") or cost.get("currency") or {})
+        code = (cur.get("code") or "IDR").upper()
+        tariff = cost.get("tariff") if cost.get("tariff") is not None else out.get("tariff")
+        return (out.get("powertrain") == "phev", out.get("tyre_indirect") is False, code,
+                _money_step(code, tariff))
+
+    def _state_pubs(self, base, out, cost):
+        chg = out.get("charging") or {}
+        energy = out.get("energy") or {}
+        km = out.get("km") or {}
+        lf = out.get("lifetime") or {}
+        ins = out.get("insights") or {}
+        health = out.get("health") or {}
+        care = out.get("battery_care") or {}
+        fuel = out.get("fuel") or {}
+        drain = out.get("drain") or {}
+        battery = out.get("battery")
+        cap = out.get("battery_kwh")
+        energy_left = None
+        if battery is not None and cap:
+            energy_left = round(battery / 100.0 * cap, 2)
+        cstate = chg.get("state")
+        cmode = chg.get("mode")
+        if not cmode:
+            cmode = "none"
+        charging = bool(chg.get("active"))
+        rate = chg.get("rate_kw") if charging else 0
+        if rate is None:
+            rate = 0
+        cons = energy.get("consumption") or energy.get("week_consumption")
+        ac_temp = out.get("ac_temp_c")
+        temp_ok = isinstance(ac_temp, int) and 16 <= ac_temp <= 30
+        online = bool(out.get("online"))
+        tyres_check = (out.get("tyre_status") or "").lower().find("check") >= 0
         try:
-            row = conn.execute(
-                "SELECT ts, raw FROM telemetry WHERE online=1 AND raw IS NOT NULL "
-                "ORDER BY ts DESC LIMIT 1"
-            ).fetchone()
-        finally:
-            conn.close()
-        if not row:
-            return None
-        ts, raw = row
-        return ts, self.decode(raw)
+            doors = int(out.get("doors") or 0)
+        except (TypeError, ValueError):
+            doors = 0
+        sh = out.get("seat_heat") or [0, 0]
+        sv = out.get("seat_vent") or [0, 0]
+        hv = out.get("hv_state")
+        hv_s = HV_STATE.get(hv, "unknown") if hv is not None else ""
+        chg_s = CHARGE_STATE.get(cstate, "") if cstate is not None else ""
+        tpms = out.get("tpms") or []
+
+        pubs = {
+            f"{base}/sensor/battery": _n(battery),
+            f"{base}/sensor/range": _n(out.get("range_km")),
+            f"{base}/sensor/odometer": _n(out.get("odometer")),
+            f"{base}/sensor/volt12": _n(out.get("volt12")),
+            f"{base}/sensor/charge_power": _n(rate),
+            f"{base}/sensor/consumption": _n(cons) if cons else "",
+            f"{base}/binary_sensor/charging": _on(charging),
+            f"{base}/binary_sensor/online": _on(online),
+            f"{base}/lock/state": "UNLOCKED" if out.get("unlocked") else "LOCKED",
+            f"{base}/climate/mode": "cool" if out.get("ac_on") else "off",
+            f"{base}/climate/action": "cooling" if out.get("ac_on") else "off",
+            f"{base}/climate/temperature": _n(ac_temp) if temp_ok else "",
+            f"{base}/cover/windows/state": "open" if out.get("windows") else "closed",
+            f"{base}/cover/sunroof/state": "open" if out.get("sunroof_open") else "closed",
+            f"{base}/cover/liftgate/state": "open" if out.get("trunk_open") else "closed",
+            f"{base}/availability": "online" if online else "offline",
+            f"{base}/sensor/charge_remaining": _n(chg.get("remaining_min")),
+            f"{base}/sensor/charge_mode": cmode,
+            f"{base}/sensor/charge_state": chg_s,
+            f"{base}/sensor/charge_session_kwh": _n(chg.get("session_kwh")),
+            f"{base}/sensor/charge_session_soc": _n(chg.get("soc")),
+            f"{base}/binary_sensor/moving": _on(out.get("moving")),
+            f"{base}/sensor/updated": _iso(out.get("updated_ts")),
+            f"{base}/sensor/tyre_status": out.get("tyre_status") or "",
+            f"{base}/binary_sensor/tyres_ok": _on(tyres_check),
+            f"{base}/binary_sensor/door": _on(doors != 0),
+            f"{base}/binary_sensor/seat_heat_left": _on(len(sh) > 0 and sh[0]),
+            f"{base}/binary_sensor/seat_heat_right": _on(len(sh) > 1 and sh[1]),
+            f"{base}/binary_sensor/seat_vent_left": _on(len(sv) > 0 and sv[0]),
+            f"{base}/binary_sensor/seat_vent_right": _on(len(sv) > 1 and sv[1]),
+            f"{base}/binary_sensor/defrost": _on(out.get("defrost_front")),
+            f"{base}/sensor/hv_state": hv_s,
+            f"{base}/sensor/volt12_status": out.get("volt12_status") or "",
+            f"{base}/sensor/volt12_min7d": _n(out.get("volt12_min7d")),
+            f"{base}/sensor/wltc_range": _n(out.get("wltc_range_km")),
+            f"{base}/sensor/parked_drain": _n(drain.get("per_day")) if drain else "",
+            f"{base}/sensor/km_today": _n(km.get("today")),
+            f"{base}/sensor/km_week": _n(km.get("week")),
+            f"{base}/sensor/km_month": _n(km.get("month")),
+            f"{base}/sensor/energy_today": _n(energy.get("today_kwh")),
+            f"{base}/sensor/energy_left": _n(energy_left),
+            f"{base}/sensor/efficiency_rating": energy.get("rating") or "",
+            f"{base}/sensor/avg_speed": _n(out.get("avg_speed")),
+            f"{base}/sensor/charges_week": _n(chg.get("week")),
+            f"{base}/sensor/charges_month": _n(chg.get("month")),
+            f"{base}/sensor/charge_month_kwh": _n(chg.get("month_kwh")),
+            f"{base}/sensor/charge_month_cost": _n(chg.get("month_cost")),
+            f"{base}/sensor/lifetime_km": _n(lf.get("km")),
+            f"{base}/sensor/lifetime_kwh": _n(lf.get("kwh_billed")),
+            f"{base}/sensor/lifetime_cost": _n(lf.get("cost")),
+            f"{base}/sensor/lifetime_saved": _n(lf.get("saved")),
+            f"{base}/sensor/liters_saved": _n(lf.get("liters_saved")),
+            f"{base}/sensor/co2_saved": _n(lf.get("co2_saved")),
+            f"{base}/sensor/running_cost": _n(ins.get("rp_per_km")),
+            f"{base}/sensor/month_cost_est": _n(ins.get("month_cost_est")),
+            f"{base}/sensor/days_to_charge": _n(ins.get("days_to_charge")),
+            f"{base}/sensor/real_range": _n(ins.get("real_range")),
+            f"{base}/sensor/rated_range": _n(ins.get("rated_range")),
+            f"{base}/sensor/battery_usable": _n(health.get("usable_kwh")),
+            f"{base}/sensor/battery_cycles": _n(health.get("cycles")),
+            f"{base}/sensor/days_since_full": _n(care.get("days_since_full")),
+            f"{base}/sensor/battery_care": care.get("state") or "",
+            f"{base}/binary_sensor/balance_due": _on(care.get("balance_due")),
+            f"{base}/number/tariff": _n(cost.get("tariff")),
+            f"{base}/number/petrol_price": _n(cost.get("petrol_price")),
+            f"{base}/number/petrol_kml": _n(cost.get("petrol_kml")),
+        }
+        for oid, _label, bit in DOOR_BITS:
+            pubs[f"{base}/binary_sensor/{oid}"] = _on(bool(doors & bit))
+        if out.get("powertrain") == "phev":
+            pubs[f"{base}/sensor/fuel"] = _n(fuel.get("pct"))
+            pubs[f"{base}/sensor/fuel_range"] = _n(fuel.get("range_km"))
+            pubs[f"{base}/sensor/total_range"] = _n(fuel.get("total_range_km"))
+            pubs[f"{base}/sensor/fuel_consumption"] = _n(fuel.get("l_100"))
+        if out.get("tyre_indirect") is False:
+            for i, (oid, _label) in enumerate(TYRE_POS):
+                wheel = tpms[i] if i < len(tpms) else {}
+                pubs[f"{base}/sensor/tyre_{oid}"] = _n(wheel.get("psi"))
+                pubs[f"{base}/sensor/tyre_{oid}_temp"] = _n(wheel.get("temp"))
+        return pubs, battery, cstate
 
     def _tick(self):
         if not self._connected:
@@ -498,77 +843,55 @@ class MqttBridge:
             caps = self.control_caps() or {}
         except Exception:
             caps = {}
-        if not self._discovery_sent:
-            self._publish_discovery(caps)
+        out = {}
+        if self.get_summary:
+            try:
+                out = self.get_summary() or {}
+            except Exception as e:
+                self._last_error = str(e)[:200]
+                out = {}
+        try:
+            cost = self.get_cost_config() or {}
+        except Exception:
+            cost = {}
+
+        fp = self._disc_fingerprint(out, cost)
+        if not self._discovery_sent or fp != self._disc_fp:
+            self._publish_discovery(caps, out, cost)
 
         base = self._topic_root()
-        latest = self._read_latest()
-        if not latest:
-            # Avoid spamming HA every poll when the DB has no frame yet.
+        if not out.get("updated") and out.get("updated_ts") is None:
             self._pub_if_changed(f"{base}/binary_sensor/online", "OFF")
             self._pub_if_changed(f"{base}/availability", "offline", retain=True)
+            for key in ("tariff", "petrol_price", "petrol_kml"):
+                self._pub_if_changed(f"{base}/number/{key}", _n(cost.get(key)))
             return
-        ts, dec = latest
-        age_min = (time.time() - ts) / 60.0
-        online = age_min < ONLINE_AGE_MIN
-        battery = dec.get("battery")
-        cstate = dec.get("charge_state")
-        charging = cstate == 1
-        rate = dec.get("charge_power") if charging else 0
-        if rate is None:
-            rate = 0
-        unlocked = bool(dec.get("unlocked"))
-        ac_on = bool(dec.get("ac_on"))
-        ac_temp = dec.get("ac_temp_c")
-        temp_ok = isinstance(ac_temp, int) and 16 <= ac_temp <= 30
-        windows_open = bool(dec.get("windows"))
-        sunroof_open = bool(dec.get("sunroof_open"))
-        trunk_open = bool(dec.get("trunk_open"))
-        consumption = dec.get("consumption") or ""
 
-        def n(v):
-            return "" if v is None else str(v)
-
-        pubs = {
-            f"{base}/sensor/battery": n(battery),
-            f"{base}/sensor/range": n(dec.get("range_km")),
-            f"{base}/sensor/odometer": n(dec.get("odometer")),
-            f"{base}/sensor/volt12": n(dec.get("volt12")),
-            f"{base}/sensor/charge_power": n(rate),
-            f"{base}/sensor/consumption": n(consumption) if consumption else "",
-            f"{base}/binary_sensor/charging": "ON" if charging else "OFF",
-            f"{base}/binary_sensor/online": "ON" if online else "OFF",
-            f"{base}/lock/state": "UNLOCKED" if unlocked else "LOCKED",
-            f"{base}/climate/mode": "cool" if ac_on else "off",
-            f"{base}/climate/action": "cooling" if ac_on else "off",
-            f"{base}/climate/temperature": n(ac_temp) if temp_ok else "",
-            f"{base}/cover/windows/state": "open" if windows_open else "closed",
-            f"{base}/cover/sunroof/state": "open" if sunroof_open else "closed",
-            f"{base}/cover/liftgate/state": "open" if trunk_open else "closed",
-            f"{base}/availability": "online" if online else "offline",
-        }
-
+        pubs, battery, cstate = self._state_pubs(base, out, cost)
         now = time.monotonic()
         due = (now - self._last_pub_mono) >= HEARTBEAT_S
         any_changed = any(self._last_pubs.get(t) != p for t, p in pubs.items())
         if any_changed or due:
-            # On change: only the topics that differ. On heartbeat: refresh all retained state.
             for topic, payload in pubs.items():
                 self._pub_if_changed(topic, payload, retain=True, force=due)
             self._last_pub_mono = now
             self._last_publish_ts = int(time.time())
 
-        # Edge events (non-retained) — real transitions only, never on heartbeat alone.
         if self._prev_charge_state == 1 and cstate == 2:
             self._pub(f"{base}/event/charge_complete",
                       {"battery": battery, "ts": int(time.time())}, retain=False)
         if battery is not None:
-            if battery < BATTERY_LOW_PCT and not self._battery_low_latched:
-                self._pub(f"{base}/event/battery_low",
-                          {"battery": battery, "ts": int(time.time())}, retain=False)
-                self._battery_low_latched = True
-            elif battery >= BATTERY_LOW_PCT + 5:
-                self._battery_low_latched = False
+            try:
+                batt = float(battery)
+            except (TypeError, ValueError):
+                batt = None
+            if batt is not None:
+                if batt < BATTERY_LOW_PCT and not self._battery_low_latched:
+                    self._pub(f"{base}/event/battery_low",
+                              {"battery": battery, "ts": int(time.time())}, retain=False)
+                    self._battery_low_latched = True
+                elif batt >= BATTERY_LOW_PCT + 5:
+                    self._battery_low_latched = False
 
         self._prev_charge_state = cstate
         self._prev_battery = battery
@@ -599,6 +922,17 @@ class MqttBridge:
         if not topic.startswith(prefix) or not topic.endswith("/set"):
             return
         mid = topic[len(prefix):-len("/set")]  # e.g. lock, climate, windows, charge_stop
+        if mid in ("tariff", "petrol_price", "petrol_kml"):
+            if not self.set_cost_config:
+                self._ack({"ok": False, "error": "set_cost_config not wired"})
+                return
+            result = self.set_cost_config(mid, payload)
+            self._ack(result)
+            if result.get("ok"):
+                base_n = self._topic_root()
+                self._pub_if_changed(f"{base_n}/number/{mid}", _n(result.get("value")),
+                                     retain=True, force=True)
+            return
         pl = payload.upper()
         action = None
 

@@ -39,17 +39,51 @@ Topics are **per-vehicle** automatically: `{base_topic}/{VIN}/…` (falls back t
 CarLinko `vehicle_id`). Two dashboard instances can share the same `base_topic` and broker
 without colliding. `base_topic` is only a shared prefix (default `j5`).
 
-Once connected, Home Assistant should auto-create a device with sensors (battery, range, odometer,
-12V, charge power, consumption), binary sensors (charging, online), and — when your car supports
-them — lock, climate (on/off), window/sunroof/liftgate covers, and Find / Stop-charging buttons.
+Once connected, Home Assistant should auto-create a device with live sensors (battery, range,
+odometer, 12V, charge, consumption, distance, energy, insights), binary sensors (charging, online,
+moving, doors, seats, tyres), writable **number** entities for charging tariff / petrol price /
+petrol km/L, and — when your car supports them — lock, climate (on/off), window/sunroof/liftgate
+covers, and Find / Stop-charging buttons. PHEV fuel sensors and per-wheel TPMS appear only when
+the car reports them. Discovery is re-sent if that changes.
+
+Computed money (`lifetime_cost`, `running_cost`, …) is a **sensor**. The knobs that feed those
+figures (`number.tariff`, `number.petrol_price`) write back to `creds.json` without a restart.
+`number.petrol_kml` is the ICE km/L comparison baseline (config, not a cost). Dashboard Settings
+petrol fields stay browser-local and are **not** synced.
 
 ### State
-| Entity | Source |
-| --- | --- |
-| Lock | telemetry `unlocked` (verified) |
-| Climate on/off | telemetry `ac_on` |
-| Windows / sunroof / liftgate | body bytes (E5-verified; treat as best-effort on other models) |
-| Sensors | same fields as `/api/summary` |
+| Entity | Type | Source |
+| --- | --- | --- |
+| `sensor.battery` | sensor | SoC % |
+| `sensor.range` / `odometer` / `volt12` | sensor | latest frame |
+| `sensor.charge_power` / `consumption` | sensor | charge kW; kWh/100km |
+| `sensor.charge_remaining` | sensor (min) | `charging.remaining_min` |
+| `sensor.charge_mode` | enum `none`/`ac`/`dc` | `charging.mode` |
+| `sensor.charge_state` | enum | `charging.state` 0–5 |
+| `sensor.charge_session_kwh` / `charge_session_soc` | sensor | current/last session |
+| `binary_sensor.charging` / `online` / `moving` | binary | flags |
+| `sensor.updated` | timestamp | last frame |
+| `sensor.fuel` / `fuel_range` / `total_range` / `fuel_consumption` | sensor | PHEV only |
+| `sensor.tyre_status` / `binary_sensor.tyres_ok` | enum / problem | `tyre_status` (problem **on** = check) |
+| `sensor.tyre_fl` … `rr` (+ `_temp`) | pressure/temp | direct TPMS only |
+| `binary_sensor.door` + four door bits | door | `doors` bitmask |
+| `binary_sensor.seat_heat_*` / `seat_vent_*` / `defrost` | binary | E5-mapped bytes |
+| `sensor.hv_state` | enum `off`/`lv`/`ready`/`unknown` | model-specific on J5 |
+| `sensor.volt12_status` / `volt12_min7d` | enum / V | 7-day 12V |
+| `sensor.wltc_range` / `parked_drain` | km / %/day | rated range; parked drain |
+| `sensor.km_today` / `km_week` / `km_month` | km | trip buckets |
+| `sensor.energy_today` / `energy_left` / `efficiency_rating` / `avg_speed` | energy / enum / km/h | `summary()` |
+| `sensor.charges_week` / `charges_month` / `charge_month_kwh` / `charge_month_cost` | sensor | history (cost is **not** writable) |
+| `sensor.lifetime_*` / `liters_saved` / `co2_saved` | sensor | log span |
+| `sensor.running_cost` / `month_cost_est` / `days_to_charge` / `real_range` / `rated_range` | sensor | insights |
+| `sensor.battery_usable` / `battery_cycles` / `days_since_full` / `battery_care` | sensor | health / LFP care |
+| `binary_sensor.balance_due` | binary | `battery_care.balance_due` |
+| `lock.lock` | lock | telemetry `unlocked` (verified) |
+| `climate.climate` | climate | `ac_on` / `ac_temp_c` |
+| `cover.windows` / `sunroof` / `liftgate` | cover | body bytes (E5-verified; best-effort on other models) |
+| `number.tariff` | number | `creds.json` `tariff` (¤/kWh) |
+| `number.petrol_price` | number | `creds.json` `petrol_price` (¤/L) |
+| `number.petrol_kml` | number | `creds.json` `petrol_kml` (km/L, ICE baseline) |
 
 Availability follows car freshness (~40 min): when the car is dark, entities go unavailable.
 
@@ -58,12 +92,19 @@ Commands use **named actions**, not raw hex. Opcodes live in `tools/control_opco
 (shipped with the repo; only **stop charging** `742701` is confirmed). Long-press a Control-tab
 button to remap — that updates the shared file so MQTT and the UI stay in sync.
 
+Number entities (`tariff`, `petrol_price`, `petrol_kml`) are not car opcodes: they PATCH
+`creds.json` and reload in-memory rates so the next telemetry tick republishes derived cost
+sensors.
+
 Events (non-retained): `{base_topic}/{vin}/event/charge_complete`,
 `{base_topic}/{vin}/event/battery_low`.
 
 ### Topic sketch
 ```
 {base}/{vin}/sensor/battery
+{base}/{vin}/sensor/charge_state
+{base}/{vin}/number/tariff
+{base}/{vin}/control/tariff/set   ← float, writes creds.json
 {base}/{vin}/lock/state          ← LOCKED / UNLOCKED
 {base}/{vin}/control/lock/set    ← LOCK / UNLOCK
 {base}/{vin}/control/climate/set ← off / cool
@@ -172,9 +213,10 @@ With MQTT you can also trigger on `{base_topic}/{vin}/event/charge_complete` /
 | `online` | car reachable (bool) |
 | `unlocked` | lock state (bool: unlocked) |
 | `ac_on` | climate on (bool) |
+| `ac_temp_c` / `doors` / `seat_heat` / `seat_vent` / `defrost_front` / `hv_state` | climate / body / HV |
 | `trunk_open` / `windows` / `sunroof_open` | body state |
 | `charging.active` | charging now (bool) |
-| `charging.rate_kw` | live charge power (kW) |
+| `charging.rate_kw` / `mode` / `state` / `remaining_min` | live charge |
 | `energy.consumption` | car's avg kWh/100km |
 | `energy.today_kwh` | energy used today (kWh) |
 | `tyre_status` | `Normal` / `Check tyres` (indirect TPMS, no PSI) |
