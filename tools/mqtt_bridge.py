@@ -21,22 +21,64 @@ import paho.mqtt.client as mqtt
 HERE = os.path.dirname(os.path.abspath(__file__))
 _DATA = os.environ.get("CARLINKO_DATA") or HERE
 
-# Fallback if tools/control_opcodes.json is missing/corrupt. The shipped file is the source of truth.
+# Fallback if tools/control_opcodes.json is missing/corrupt. Source of truth = Blutter jump table.
 DEFAULT_OPCODES = {
-    "lock": "741000",
-    "unlock": "741001",
-    "acOn": "742401",
-    "acOff": "742400",
-    "winOpen": "741501",
-    "winClose": "741500",
-    "winVent": "741502",
-    "roofOpen": "741A01",
-    "roofClose": "741A00",
-    "roofTilt": "741A02",
-    "liftOpen": "741201",
-    "find": "740100",
+    "lock": "740100", "unlock": "740200",
+    "liftOpen": "740300", "liftClose": "740A00",
+    "find": "740400",
+    "winClose": "740500", "winOpen": "740600", "winVent": "740E00",
+    "roofClose": "740F00", "roofTilt": "740F02", "roofOpen": "740F01",
+    "engineOn": "740700", "engineOff": "740800",
+    "acOn": "741001", "acOff": "741000",
+    "acQuickHeatOn": "741F01", "acQuickHeatOff": "741F00",
+    "acQuickCoolOn": "742001", "acQuickCoolOff": "742000",
+    "acPurifyOn": "742501", "acPurifyOff": "742500",
+    "defrostOn": "741201", "defrostOff": "741200",
+    "windshieldHeatOn": "742301", "windshieldHeatOff": "742300",
+    "steerHeatOn": "742401", "steerHeatOff": "742400",
+    "steerHeatLOn": "742401", "steerHeatLOff": "742400",
+    "steerHeatROn": "742401", "steerHeatROff": "742400",
+    "seatHeatLOff": "741500", "seatHeatL1": "741501", "seatHeatL2": "741502", "seatHeatL3": "741503",
+    "seatVentLOff": "741A00", "seatVentL1": "741A01", "seatVentL2": "741A02", "seatVentL3": "741A03",
+    "seatHeatLROff": "741700", "seatHeatLR1": "741701", "seatHeatLR2": "741702", "seatHeatLR3": "741703",
+    "seatVentLROff": "741C00", "seatVentLR1": "741C01", "seatVentLR2": "741C02", "seatVentLR3": "741C03",
+    "seatHeatROff": "741600", "seatHeatR1": "741601", "seatHeatR2": "741602", "seatHeatR3": "741603",
+    "seatVentROff": "741B00", "seatVentR1": "741B01", "seatVentR2": "741B02", "seatVentR3": "741B03",
+    "seatHeatRROff": "741900", "seatHeatRR1": "741901", "seatHeatRR2": "741902", "seatHeatRR3": "741903",
+    "seatVentRROff": "741E00", "seatVentRR1": "741E01", "seatVentRR2": "741E02", "seatVentRR3": "741E03",
     "chgStop": "742701",
+    "gearHigh": "742602", "gearLow": "742600",
 }
+
+OPCODES_VERSION = 2
+
+
+def _valid_opcode(s):
+    s = str(s or "").strip()
+    return bool(s) and len(s) <= 16 and all(ch in "0123456789abcdefABCDEF" for ch in s)
+
+
+def build_ac_temp_opcode(celsius):
+    """Index 13: 7411 + setpoint °C as a raw byte (TemperatureType 0)."""
+    try:
+        t = int(round(float(celsius)))
+    except Exception:
+        return None
+    if t < 0 or t > 255:
+        return None
+    return f"7411{t:02X}"
+
+
+def opcodes_version():
+    path = opcodes_path()
+    if os.path.isfile(path):
+        try:
+            raw = json.load(open(path, encoding="utf-8"))
+            if isinstance(raw, dict) and raw.get("_version") is not None:
+                return int(raw["_version"])
+        except Exception:
+            pass
+    return OPCODES_VERSION
 
 POLL_S = 2.5
 HEARTBEAT_S = 30.0  # republish retained state at least this often; otherwise only on change
@@ -71,45 +113,50 @@ def load_opcodes():
     if not isinstance(raw, dict):
         return out
     for k, v in raw.items():
-        if k.startswith("_"):
+        if str(k).startswith("_"):
             continue
-        if k not in DEFAULT_OPCODES:
-            continue
-        s = str(v or "").strip()
-        if s and all(ch in "0123456789abcdefABCDEF" for ch in s) and len(s) <= 16:
-            out[k] = s
+        if _valid_opcode(v):
+            out[str(k)] = str(v).strip()
     return out
 
 
 def save_opcodes(mapping):
     """Merge validated remaps into tools/control_opcodes.json. Returns the effective map."""
     path = opcodes_path()
+    meta = {"_version": OPCODES_VERSION,
+            "_comment": "Blutter assembledSendData jump table. Remaps merged via /api/opcodes."}
     existing = dict(DEFAULT_OPCODES)
     if os.path.isfile(path):
         try:
             raw = json.load(open(path, encoding="utf-8"))
             if isinstance(raw, dict):
                 for k, v in raw.items():
-                    if str(k).startswith("_") or k not in DEFAULT_OPCODES:
+                    if str(k).startswith("_"):
+                        if k in ("_version", "_comment"):
+                            meta[k] = v
                         continue
-                    s = str(v or "").strip()
-                    if s:
-                        existing[k] = s
+                    if _valid_opcode(v):
+                        existing[str(k)] = str(v).strip()
         except Exception:
             pass
     clean = dict(existing)
     for k, v in (mapping or {}).items():
-        if k.startswith("_") or k not in DEFAULT_OPCODES:
+        k = str(k)
+        if k.startswith("_"):
             continue
         s = str(v or "").strip()
         if not s:
-            clean[k] = DEFAULT_OPCODES[k]
+            if k in DEFAULT_OPCODES:
+                clean[k] = DEFAULT_OPCODES[k]
+            else:
+                clean.pop(k, None)
             continue
-        if not all(ch in "0123456789abcdefABCDEF" for ch in s) or len(s) > 16:
+        if not _valid_opcode(s):
             raise ValueError(f"invalid opcode for {k}")
         clean[k] = s
+    out = {**meta, **clean}
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(clean, f, indent=2, ensure_ascii=False)
+        json.dump(out, f, indent=2, ensure_ascii=False)
         f.write("\n")
     return load_opcodes()
 
@@ -653,7 +700,7 @@ class MqttBridge:
             })
         ac = caps.get("ac") or {}
         if ac.get("switch"):
-            disc("climate", "climate", {
+            clim = {
                 "name": "Climate",
                 "mode_command_topic": f"{base}/control/climate/set",
                 "mode_state_topic": f"{base}/climate/mode",
@@ -661,7 +708,13 @@ class MqttBridge:
                 "current_temperature_topic": f"{base}/climate/temperature",
                 "temperature_unit": "C",
                 "action_topic": f"{base}/climate/action",
-            })
+            }
+            if ac.get("temp"):
+                clim["temperature_command_topic"] = f"{base}/control/climate_temp/set"
+                clim["min_temp"] = float(ac.get("min") or 15)
+                clim["max_temp"] = float(ac.get("max") or 31)
+                clim["temp_step"] = float(ac.get("step") or 1)
+            disc("climate", "climate", clim)
         win = caps.get("windows") or {}
         if win.get("open") or win.get("close") or win.get("vent"):
             disc("cover", "windows", {
@@ -702,6 +755,69 @@ class MqttBridge:
                 "name": "Stop charging",
                 "command_topic": f"{base}/control/charge_stop/set",
                 "payload_press": "PRESS",
+            })
+        if caps.get("engine"):
+            disc("switch", "engine", {
+                "name": "Engine",
+                "state_topic": f"{base}/binary_sensor/engine_on/state",
+                "command_topic": f"{base}/control/engine/set",
+                "payload_on": "ON", "payload_off": "OFF",
+                "state_on": "ON", "state_off": "OFF",
+            })
+            disc("binary_sensor", "engine_on", {
+                "name": "Engine on",
+                "state_topic": f"{base}/binary_sensor/engine_on/state",
+                "payload_on": "ON", "payload_off": "OFF",
+            })
+        if caps.get("gear"):
+            disc("select", "gear", {
+                "name": "Gear",
+                "command_topic": f"{base}/control/gear/set",
+                "options": ["low", "high"],
+            })
+        if ac.get("rapidCool"):
+            disc("button", "quick_cool", {
+                "name": "Quick cool",
+                "command_topic": f"{base}/control/quick_cool/set",
+                "payload_press": "PRESS",
+            })
+        if ac.get("rapidHeat"):
+            disc("button", "quick_heat", {
+                "name": "Quick heat",
+                "command_topic": f"{base}/control/quick_heat/set",
+                "payload_press": "PRESS",
+            })
+        if ac.get("defog"):
+            disc("switch", "defrost", {
+                "name": "Defog",
+                "command_topic": f"{base}/control/defrost/set",
+                "payload_on": "ON", "payload_off": "OFF",
+            })
+        if ac.get("purify"):
+            disc("switch", "purify", {
+                "name": "Air purify",
+                "command_topic": f"{base}/control/purify/set",
+                "payload_on": "ON", "payload_off": "OFF",
+            })
+        seats = caps.get("seats") or {}
+        seat_labels = (
+            ("heatL", "Driver seat heat"),
+            ("ventL", "Driver seat vent"),
+            ("heatR", "Passenger seat heat"),
+            ("ventR", "Passenger seat vent"),
+            ("heatLR", "Rear L seat heat"),
+            ("ventLR", "Rear L seat vent"),
+            ("heatRR", "Rear R seat heat"),
+            ("ventRR", "Rear R seat vent"),
+        )
+        for sk, name in seat_labels:
+            mx = int(seats.get(sk) or 0)
+            if mx <= 0:
+                continue
+            disc("select", f"seat_{sk}", {
+                "name": name,
+                "command_topic": f"{base}/control/seat_{sk}/set",
+                "options": ["off"] + [f"L{i}" for i in range(1, mx + 1)],
             })
         self._discovery_sent = True
         self._disc_fp = (phev, direct_tpms, code, step)
@@ -786,6 +902,7 @@ class MqttBridge:
             f"{base}/binary_sensor/seat_vent_left": _on(len(sv) > 0 and sv[0]),
             f"{base}/binary_sensor/seat_vent_right": _on(len(sv) > 1 and sv[1]),
             f"{base}/binary_sensor/defrost": _on(out.get("defrost_front")),
+            f"{base}/binary_sensor/engine_on": _on(out.get("engine_on")),
             f"{base}/sensor/hv_state": hv_s,
             f"{base}/sensor/volt12_status": out.get("volt12_status") or "",
             f"{base}/sensor/volt12_min7d": _n(out.get("volt12_min7d")),
@@ -970,13 +1087,91 @@ class MqttBridge:
         elif mid == "liftgate":
             if pl == "OPEN":
                 action = "liftOpen"
-            # CLOSE not mapped distinctly in CTRL_ACTIONS; ignore
+            elif pl == "CLOSE":
+                action = "liftClose"
         elif mid == "find":
             if pl in ("PRESS", "ON", "1"):
                 action = "find"
         elif mid == "charge_stop":
             if pl in ("PRESS", "ON", "1"):
                 action = "chgStop"
+        elif mid == "engine":
+            if pl in ("ON", "1"):
+                action = "engineOn"
+            elif pl in ("OFF", "0"):
+                action = "engineOff"
+        elif mid == "gear":
+            if pl in ("HIGH", "H"):
+                action = "gearHigh"
+            elif pl in ("LOW", "L"):
+                action = "gearLow"
+        elif mid == "quick_cool":
+            if pl in ("PRESS", "ON", "1"):
+                action = "acQuickCoolOn"
+        elif mid == "quick_heat":
+            if pl in ("PRESS", "ON", "1"):
+                action = "acQuickHeatOn"
+        elif mid == "defrost":
+            if pl in ("ON", "1"):
+                action = "defrostOn"
+            elif pl in ("OFF", "0"):
+                action = "defrostOff"
+        elif mid == "purify":
+            if pl in ("ON", "1"):
+                action = "acPurifyOn"
+            elif pl in ("OFF", "0"):
+                action = "acPurifyOff"
+        elif mid == "climate_temp":
+            # HA temperature setpoint → dynamic 7411XX opcode
+            try:
+                caps = self.control_caps() or {}
+            except Exception:
+                caps = {}
+            if not (caps.get("ac") or {}).get("temp"):
+                self._ack({"ok": False, "error": "not supported by this car", "action": "acTemp"})
+                return
+            try:
+                # payload may be bare number or JSON
+                if payload.startswith("{"):
+                    t = float(json.loads(payload).get("temperature"))
+                else:
+                    t = float(payload)
+            except Exception:
+                self._ack({"ok": False, "error": "bad temperature", "payload": payload})
+                return
+            code = build_ac_temp_opcode(t)
+            if not code or not self.send_control:
+                self._ack({"ok": False, "error": "temp opcode failed"})
+                return
+            self.send_control("77", 20)
+            time.sleep(0.6)
+            d = self.send_control(code, 20)
+            ok = str(d.get("code")) == "0000"
+            self._ack({"ok": ok, "action": "acTemp", "opcode": code, "celsius": t,
+                       "code": d.get("code"), "msg": d.get("msg"), "ts": int(time.time())})
+            return
+        elif mid.startswith("seat_"):
+            sk = mid[5:]  # heatL, ventR, …
+            prefix = {
+                "heatL": "seatHeatL", "ventL": "seatVentL",
+                "heatR": "seatHeatR", "ventR": "seatVentR",
+                "heatLR": "seatHeatLR", "ventLR": "seatVentLR",
+                "heatRR": "seatHeatRR", "ventRR": "seatVentRR",
+            }.get(sk)
+            if not prefix:
+                self._ack({"ok": False, "error": "unknown seat zone", "topic": topic})
+                return
+            raw = payload.strip().upper()
+            if raw in ("OFF", "0", "L0"):
+                action = prefix + "Off"
+            elif raw.startswith("L") and raw[1:].isdigit():
+                action = prefix + raw[1:]
+            elif raw.isdigit():
+                n = int(raw)
+                action = prefix + "Off" if n <= 0 else prefix + str(n)
+            else:
+                self._ack({"ok": False, "error": "bad seat level", "payload": payload})
+                return
 
         if not action:
             self._ack({"ok": False, "error": "unknown command", "topic": topic, "payload": payload})
@@ -996,10 +1191,12 @@ class MqttBridge:
 
     @staticmethod
     def _action_allowed(action, caps):
+        ac = caps.get("ac") or {}
+        seats = caps.get("seats") or {}
         if action in ("lock", "unlock"):
             return bool(caps.get("lock"))
         if action in ("acOn", "acOff"):
-            return bool((caps.get("ac") or {}).get("switch"))
+            return bool(ac.get("switch"))
         if action == "winOpen":
             return bool((caps.get("windows") or {}).get("open"))
         if action == "winClose":
@@ -1012,12 +1209,38 @@ class MqttBridge:
             return bool((caps.get("sunroof") or {}).get("open"))
         if action == "roofTilt":
             return bool((caps.get("sunroof") or {}).get("tilt"))
-        if action == "liftOpen":
+        if action in ("liftOpen", "liftClose"):
             return bool(caps.get("liftgate") or caps.get("trunk"))
         if action == "find":
             return bool(caps.get("find"))
         if action == "chgStop":
             return bool(caps.get("charging"))
+        if action in ("engineOn", "engineOff"):
+            return bool(caps.get("engine"))
+        if action in ("gearHigh", "gearLow"):
+            return bool(caps.get("gear"))
+        if action in ("acQuickCoolOn", "acQuickCoolOff"):
+            return bool(ac.get("rapidCool"))
+        if action in ("acQuickHeatOn", "acQuickHeatOff"):
+            return bool(ac.get("rapidHeat"))
+        if action in ("defrostOn", "defrostOff"):
+            return bool(ac.get("defog"))
+        if action in ("acPurifyOn", "acPurifyOff"):
+            return bool(ac.get("purify"))
+        if action in ("windshieldHeatOn", "windshieldHeatOff"):
+            return bool(caps.get("windshieldHeat"))
+        if action in ("steerHeatOn", "steerHeatOff", "steerHeatLOn", "steerHeatLOff",
+                      "steerHeatROn", "steerHeatROff"):
+            return bool(caps.get("steerHeat"))
+        # seatHeatLOff / seatHeatL1 … (longer prefixes first so LR/RR don't match L/R)
+        for sk, prefix in (
+            ("heatLR", "seatHeatLR"), ("ventLR", "seatVentLR"),
+            ("heatRR", "seatHeatRR"), ("ventRR", "seatVentRR"),
+            ("heatL", "seatHeatL"), ("ventL", "seatVentL"),
+            ("heatR", "seatHeatR"), ("ventR", "seatVentR"),
+        ):
+            if action == prefix + "Off" or (action.startswith(prefix) and action[len(prefix):].isdigit()):
+                return int(seats.get(sk) or 0) > 0
         return False
 
 

@@ -125,6 +125,7 @@ the only honest output is status. An abnormal tyre would surface via CarLinko al
 | `odometer` | bytes 18–20 (BE u24) | 882 |
 | `fuel_pct` **(PHEV)** | byte 21 | 58 % — `0` on every BEV frame |
 | `ac_on` | byte 23 | `0`=off, `!=0`=on (climate). **Live-verified on the E5**: a manual A/C toggle moved exactly this byte; fan/temp/seat/defrost changes leave it alone |
+| `engine_on` (candidate) | byte 26 | `!=0` while remote engine/power on — correlated on OMODA 9 (with `hv_state`); treat as model-specific until more cars confirm |
 | `ac_temp_c` | byte 24 | A/C target temp, **raw °C, no scaling** (E5, #5 — fits the Tiggo 8's `23` as a set point). ⚠️ On the J5 the byte reads 159–169, so treat as model-specific |
 | `battery_pct` | byte 28 | 49 |
 | `range_km` (EV) | bytes 29–30 (BE u16) | 248 |

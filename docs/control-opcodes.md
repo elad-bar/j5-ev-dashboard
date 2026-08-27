@@ -1,77 +1,104 @@
-# CarLinko remote-control opcodes — decoded (static, Blutter)
+# CarLinko remote-control opcodes — Blutter jump table
 
-Recovered 2026-07-28 from the Dart AOT disassembly of `libapp.so`
-(`asm/carlinko/tools/send_vehicle_control_data_utils.dart::assembledSendData`). These are the
-`data` values for `POST /user/vehicle/remoteControl` — the actual actuation commands, distinct
-from the init handshake.
+Recovered from Dart AOT (`send_vehicle_control_data_utils.dart::assembledSendData`) plus
+`vcLoadingMessage` / `VehicleControlActionEnum` labels. These are the `data` values for
+`POST /user/vehicle/remoteControl`.
+
+**Live-confirmed on this project:** A/C on `741001` / off `741000` (2026-08). Stop charging
+`742701` was previously confirmed from an app log string. Other rows are **Blutter-mapped** —
+verify on an awake car before trusting them.
+
+Shipped map: [`tools/control_opcodes.json`](../tools/control_opcodes.json) (`_version: 2`).
+CLI: `python tools/send_control.py acOn` · `python tools/send_control.py acTemp 22`.
 
 ## Format
+
 ```
-74 <CMD> <STATE>        (6 hex chars, ASCII string in the app)
+74 <CMD> <STATE>        (6 hex chars; temp set is 7411 + °C byte)
   74      = control-command prefix
-  <CMD>   = command id (0x01..0x27)
-  <STATE> = 00 off/close · 01 on/open · 02/03 extra mode/position
+  <CMD>   = command id
+  <STATE> = 00 off/close · 01 on/open · 02/03 extra mode/level
 ```
-`assembledSendData(int controlType)` is a jump-table switch: `controlType` (an int enum) indexes
-to the opcode. The CMD byte is NOT the controlType — the mapping is via the jump table, so the exact
-CMD↔button label still needs a 1-tap runtime confirm (fire it, watch the car).
 
-## Init (sent first — the app's "initializing car")
-Raw (not 74-prefixed): `2301` (0x23), `24` (0x24), `77` (0x77) — recovered from symbols
-`_sendInitCmd0x23Data / 0x24 / 0x77`. Send before an actuation command.
+Init handshake (no actuation): `2301`, `24`, `77` — send `77` before an actuation (Control tab /
+MQTT / `send_control.py` do this).
 
-## Confirmed
-- **`742701` = STOP CHARGING** — app log string `当前执行停止充电操作---->742701`.
+## Jump-table index → action → opcode
 
-## Full opcode set (from the constant pool)
-```
-740100 740200 740300 740400 740500 740600 740700 740800 740A00 740E00
-740F00 740F01 740F02
-741000 741001
-741200 741201
-741500 741501 741502 741503     \
-741600 741601 741602 741603      |
-741700 741701 741702 741703      |  4-state groups (00/01/02/03) =
-741900 741901 741902 741903      |  windows (close/open/vent/…) + sunroof
-741A00 741A01 741A02 741A03      |
-741B00 741B01 741B02 741B03      |
-741C00 741C01 741C02 741C03      |
-741E00 741E01 741E02 741E03     /
-741F00 741F01
-742000 742001
-742300 742301
-742400 742401
-742500 742501
-742600 742602
-742701   (stop charge)
-```
-Control set (from `vehicle_control_response_handle.dart` result labels): Lock, Unlock, TrunkOpen,
-Window open/close/vent, Sunroof, FindCar, A/C on/off + cool/heat + temperature, AirPurifier,
-DefrostFront, SeatHeat, SteeringHeat, EngineStart, QuickCool/QuickHeat, Charge start/stop.
+| Index | Action | Opcode | Confidence |
+|------:|--------|--------|------------|
+| 0 | door lock | `740100` | blutter |
+| 1 | door unlock | `740200` | blutter |
+| 2 | windows close | `740500` | blutter |
+| 3 | windows vent | `740E00` | blutter |
+| 4 | windows open | `740600` | blutter |
+| 5 | trunk/liftgate open | `740300` | blutter |
+| 6 | trunk/liftgate close | `740A00` | blutter |
+| 7 | find car | `740400` | blutter |
+| 8 | sunroof close | `740F00` | blutter |
+| 9 | sunroof raise/tilt | `740F02` | blutter |
+| 10 | sunroof open | `740F01` | blutter |
+| 11 | engine on | `740700` | blutter |
+| 12 | engine off | `740800` | blutter |
+| 13 | temp set | `7411` + °C byte | blutter |
+| 14 | A/C on | `741001` | **live** |
+| 15 | A/C off | `741000` | **live** |
+| 16–17 | quick heat on/off | `741F01` / `741F00` | blutter |
+| 18–19 | quick cool on/off | `742001` / `742000` | blutter |
+| 20–21 | air purify on/off | `742501` / `742500` | blutter |
+| 22–23 | front defog on/off | `741201` / `741200` | blutter |
+| 24–27 | L windshield / steering heat family | `7423xx` / `7424xx` | blutter |
+| 36–37 | steering heat on/off | `742401` / `742400` | blutter |
+| 46–51 | L seat heat L1–L3 / off | `741501`–`741503` / `741500` | blutter |
+| 52–57 | L seat vent | `741A01`–`741A03` / `741A00` | blutter |
+| 58–63 | L rear heat | `741701`–`741703` / `741700` | blutter |
+| 64–69 | L rear vent | `741C01`–`741C03` / `741C00` | blutter |
+| 70–75 | R seat heat | `741601`–`741603` / `741600` | blutter |
+| 76–81 | R seat vent | `741B01`–`741B03` / `741B00` | blutter |
+| 82–87 | R rear heat | `741901`–`741903` / `741900` | blutter |
+| 88–93 | R rear vent | `741E01`–`741E03` / `741E00` | blutter |
+| 95 | stop charging | `742701` | **live** (app log) |
+| 96–97 | gear high / low | `742602` / `742600` | blutter |
+| 98–99 | BLE lock / unlock | same as 0/1 | alias |
 
-## Best-effort label map (wired into the Control tab — VERIFY & report mismatches)
-Only `742701` is confirmed; the rest are educated from opcode structure + the car's capabilities.
-Long-press a Control-tab button to correct its opcode in-place.
+Indices ~28–35 (generic seat On/Off) are **incomplete in the binary** (some Off cases return
+`""` and send nothing). Use the leveled `*1`/`*2`/`*3` / `*Off` commands instead.
 
-| Button | Opcode | Confidence |
-|---|---|---|
-| Stop charging | `742701` | **confirmed** (app log) |
-| Lock | `741000` | guess (0x10 off) |
-| Unlock | `741001` | guess (0x10 on) |
-| A/C on | `742401` | guess (0x24 on) |
-| A/C off | `742400` | guess (0x24 off) |
-| Windows open | `741501` | guess (0x15 state1) |
-| Windows close | `741500` | guess (0x15 state0) |
-| Windows vent | `741502` | guess (0x15 state2) |
-| Sunroof open | `741A01` | guess (0x1A on) |
-| Sunroof close | `741A00` | guess (0x1A off) |
-| Sunroof tilt | `741A02` | guess (0x1A state2) |
-| Tailgate (bagasi) | `741201` | guess (0x12 on) |
-| Find car | `740100` | guess (0x01) |
+## Function-ID cheat sheet
 
-## To finish the map
-Fire each `74xx01` (on/open variant) at an **awake** car via the dashboard Control tab (it inits
-`77` first, then fires), watch which control moves, and label it. `742701` is already known.
-Full runtime capture (all labels at once) = mitm the app tapping each control — see
-`D:\android-mitm\README.md` (emulator + mitmproxy stack is built; the last mile is a TUN redirect
-because Flutter ignores the system proxy).
+| ID | Feature |
+|----|---------|
+| 01/02 | lock / unlock |
+| 03/0A | trunk open / close |
+| 04 | find car |
+| 05/06/0E | windows close / open / vent |
+| 07/08 | engine on / off |
+| 0F | sunroof |
+| 10 | A/C |
+| 11 | temperature |
+| 12 | front defog |
+| 15/16 | L/R seat heat |
+| 17/19 | L/R rear heat |
+| 1A/1B | L/R seat vent |
+| 1C/1E | L/R rear vent |
+| 1F/20 | quick heat / cool |
+| 23/24 | windshield / steering heat |
+| 25 | air purify |
+| 26/27 | gear / stop charge |
+
+## Named keys (dashboard / MQTT)
+
+See `tools/control_opcodes.json`. Examples: `lock`, `engineOn`, `acOn`, `liftClose`,
+`seatHeatL1`, `gearHigh`. Temp uses builder `7411%02X` (°C), not a fixed JSON entry.
+
+## Old guess map (removed in v2)
+
+The previous best-effort wiring was **wrong** (e.g. A/C was `742401`, which is steering heat;
+`liftOpen` was `741201`, which is front defog). Do not reuse those hex values for the old labels.
+
+## How to re-verify
+
+1. Car awake, cellular online.
+2. `python tools/send_control.py <action>` or Control-tab tester.
+3. Optional: compare `/api/summary` / DB blob bytes (`b23` A/C, `b26` engine_on candidate,
+   `b5` HV) before and after the command.

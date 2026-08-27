@@ -311,7 +311,13 @@
   .ctrlbtn.busy{opacity:.45;pointer-events:none}
   .ctrlbtn:active{transform:scale(.97)}
   .ctrlnote{font-size:12px;color:var(--muted);margin:2px 0 12px;line-height:1.45}
+  .ctrlsec{margin:16px 0 4px}
+  .ctrlsec .over{margin-bottom:8px}
+  .ctrlseat{display:flex;flex-direction:column;gap:8px;margin:8px 0}
+  .ctrlseat label{display:flex;justify-content:space-between;align-items:center;gap:10px;font-size:13px}
+  .ctrlseat select{font:inherit;padding:8px 10px;border-radius:10px;border:1px solid var(--line);background:var(--surface);color:var(--ink);min-width:110px}
   .ctrlac{margin:16px 0 4px}
+  .ctrlac .tpbtn{margin-top:10px;width:100%}
   .acrow{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px}
   .ctrlknown{margin:12px 0 4px;font-size:11.5px;color:var(--muted);display:flex;flex-wrap:wrap;gap:6px;align-items:center}
   .chipbtn{border:1px solid var(--line);background:var(--surface);color:var(--ink);border-radius:9px;
@@ -770,16 +776,25 @@
 
   <section id="ctrlSec">
     <div class="head2"><div class="over">Control <span class="badge warn">BETA</span></div><span class="badge" id="ctrlBadge">&mdash;</span></div>
-    <div class="ctrlnote" id="ctrlNote"><b>Beta.</b> Labels use best-effort opcodes decoded from the app (only <b>Stop charging</b> = confirmed). Each tap inits then fires. <b>Long-press a button</b> to fix a wrong opcode. Car must be awake or it fails (<b>50043</b>). Tap = real actuation — watch the car. <b>Cloud only — no Bluetooth</b>, so the car needs cellular signal; the app's Bluetooth-proximity control isn't implemented.</div>
+    <div class="ctrlnote" id="ctrlNote"><b>Beta.</b> Opcodes from the app Blutter map (A/C on/off <b>live-confirmed</b>). Each tap inits then fires. <b>Long-press</b> a button to remap. Car must be awake or it fails (<b>50043</b>). <b>Cloud only — no Bluetooth</b>.</div>
     <div id="ctrlGrid" class="ctrlgrid"></div>
+    <div class="ctrlsec" id="ctrlClimateExtras" style="display:none">
+      <div class="over">Climate extras</div>
+      <div id="ctrlClimateGrid" class="ctrlgrid"></div>
+    </div>
     <div class="ctrlac" id="ctrlAc" style="display:none">
       <div class="acrow"><span class="over">A/C temperature</span><b class="num"><span id="ctrlAcTemp">22.0</span><u>&deg;C</u></b></div>
       <input type="range" id="ctrlAcSlider" class="slider" min="160" max="300" step="5" value="220">
+      <button type="button" id="ctrlAcSend" class="tpbtn">Set temperature</button>
+    </div>
+    <div class="ctrlsec" id="ctrlSeats" style="display:none">
+      <div class="over">Seats</div>
+      <div id="ctrlSeatRows" class="ctrlseat"></div>
     </div>
     <div class="expander" id="ctrlDiscToggle" style="margin-top:14px"><span>Opcode tester &mdash; discover commands</span><span class="chev">&rsaquo;</span></div>
     <div id="ctrlDisc" style="display:none">
       <div class="plancost" style="gap:8px;flex-wrap:wrap">
-        <label>Opcode (hex) <input id="ctrlOp" type="text" placeholder="e.g. 2301" style="width:110px;text-align:left"></label>
+        <label>Opcode (hex) <input id="ctrlOp" type="text" placeholder="e.g. 740700" style="width:110px;text-align:left"></label>
         <label>timeout <input id="ctrlTo" type="number" inputmode="numeric" value="20" style="width:56px"></label>
         <button id="ctrlFire" class="tpbtn">Send</button>
       </div>
@@ -1592,33 +1607,54 @@ function applySpecs(){
   $('specPerfHd').style.display=(S.performance||[]).length?'':'none';
   $('specDimHd').style.display =(S.dimensions ||[]).length?'':'none';
 }
-// ---- Control tab: fire remote-control opcodes at the car (replaces the CarLinko app) ----
-// Opcodes aren't hardcoded: labels below map to a hex opcode you assign (tap to set / long-press
-// to edit), stored in this browser. Discover each opcode with the tester, then assign it here.
-// op = best-effort opcode from the static decode (74<cmd><state>). 742701 (stop charge) is confirmed;
-// the rest are educated from structure -- long-press any button to correct its opcode, then tell me.
-const CTRL_ACTIONS=[
-  {k:'lock',    lbl:'Lock',             op:'741000', cap:c=>c.lock,                    confirm:false},
-  {k:'unlock',  lbl:'Unlock',           op:'741001', cap:c=>c.lock,                    confirm:true},
-  {k:'acOn',    lbl:'A/C on',           op:'742401', cap:c=>c.ac&&c.ac.switch,         confirm:false},
-  {k:'acOff',   lbl:'A/C off',          op:'742400', cap:c=>c.ac&&c.ac.switch,         confirm:false},
-  {k:'winOpen', lbl:'Windows open',     op:'741501', cap:c=>c.windows&&c.windows.open, confirm:true},
-  {k:'winClose',lbl:'Windows close',    op:'741500', cap:c=>c.windows&&c.windows.close,confirm:false},
-  {k:'winVent', lbl:'Windows vent',     op:'741502', cap:c=>c.windows&&c.windows.vent, confirm:false},
-  {k:'roofOpen',lbl:'Sunroof open',     op:'741A01', cap:c=>c.sunroof&&c.sunroof.open,  confirm:true},
-  {k:'roofClose',lbl:'Sunroof close',   op:'741A00', cap:c=>c.sunroof&&c.sunroof.open,  confirm:false},
-  {k:'roofTilt',lbl:'Sunroof tilt',     op:'741A02', cap:c=>c.sunroof&&c.sunroof.tilt,  confirm:false},
-  {k:'liftOpen',lbl:'Tailgate (bagasi)',op:'741201', cap:c=>c.liftgate,                 confirm:true},
-  {k:'find',    lbl:'Find car',         op:'740100', cap:c=>c.find,                     confirm:false},
-  {k:'chgStop', lbl:'Stop charging',    op:'742701', cap:c=>c.charging,                 confirm:true},
+// ---- Control tab: fire remote-control opcodes (Blutter assembledSendData map, v2) ----
+const CTRL_PRIMARY = [
+  {k:'lock',     lbl:'Lock',              op:'740100', cap:c=>c.lock,                    confirm:false},
+  {k:'unlock',   lbl:'Unlock',            op:'740200', cap:c=>c.lock,                    confirm:true},
+  {k:'engineOn', lbl:'Engine on',         op:'740700', cap:c=>c.engine,                  confirm:true},
+  {k:'engineOff',lbl:'Engine off',        op:'740800', cap:c=>c.engine,                  confirm:false},
+  {k:'acOn',     lbl:'A/C on',            op:'741001', cap:c=>c.ac&&c.ac.switch,         confirm:false},
+  {k:'acOff',    lbl:'A/C off',           op:'741000', cap:c=>c.ac&&c.ac.switch,         confirm:false},
+  {k:'winOpen',  lbl:'Windows open',      op:'740600', cap:c=>c.windows&&c.windows.open, confirm:true},
+  {k:'winClose', lbl:'Windows close',     op:'740500', cap:c=>c.windows&&c.windows.close,confirm:false},
+  {k:'winVent',  lbl:'Windows vent',      op:'740E00', cap:c=>c.windows&&c.windows.vent, confirm:false},
+  {k:'roofOpen', lbl:'Sunroof open',      op:'740F01', cap:c=>c.sunroof&&c.sunroof.open, confirm:true},
+  {k:'roofClose',lbl:'Sunroof close',     op:'740F00', cap:c=>c.sunroof&&c.sunroof.open, confirm:false},
+  {k:'roofTilt', lbl:'Sunroof tilt',      op:'740F02', cap:c=>c.sunroof&&c.sunroof.tilt, confirm:false},
+  {k:'liftOpen', lbl:'Tailgate open',     op:'740300', cap:c=>c.liftgate||c.trunk,       confirm:true},
+  {k:'liftClose',lbl:'Tailgate close',    op:'740A00', cap:c=>c.liftgate||c.trunk,       confirm:false},
+  {k:'find',     lbl:'Find car',          op:'740400', cap:c=>c.find,                    confirm:false},
+  {k:'chgStop',  lbl:'Stop charging',     op:'742701', cap:c=>c.charging,                confirm:true},
+  {k:'gearHigh', lbl:'Gear high',         op:'742602', cap:c=>c.gear,                    confirm:false},
+  {k:'gearLow',  lbl:'Gear low',          op:'742600', cap:c=>c.gear,                    confirm:false},
 ];
-// REAL control opcodes decoded from send_vehicle_control_data_utils.dart (Blutter). Format
-// 74<CMD><STATE>: STATE 00=off/close 01=on/open 02/03=mode. 742701 confirmed = stop charging.
-// These are the "on/open" variants (visible action) — tap each at the car to identify, then report.
-// The car may need init (2301/24/77) first. UNKNOWN mapping — watch the car; any may actuate.
-const CTRL_CANDIDATES=["740100","740200","740300","740400","740500","740600","740700","740800","740A00","740E00","740F01","741001","741201","741501","741601","741701","741901","741A01","741B01","741C01","741E01","741F01","742001","742301","742401","742501","742701"];
-let CTRL_CAPS=null, CTRL_KNOWN=[], CTRL_OPCODES={};
-function ctrlMap(){ // server map wins; localStorage is a cache for offline / older servers
+const CTRL_CLIMATE = [
+  {k:'acQuickCoolOn',  lbl:'Quick cool on',  op:'742001', cap:c=>c.ac&&c.ac.rapidCool, confirm:false},
+  {k:'acQuickCoolOff', lbl:'Quick cool off', op:'742000', cap:c=>c.ac&&c.ac.rapidCool, confirm:false},
+  {k:'acQuickHeatOn',  lbl:'Quick heat on',  op:'741F01', cap:c=>c.ac&&c.ac.rapidHeat, confirm:false},
+  {k:'acQuickHeatOff', lbl:'Quick heat off', op:'741F00', cap:c=>c.ac&&c.ac.rapidHeat, confirm:false},
+  {k:'defrostOn',      lbl:'Defog on',       op:'741201', cap:c=>c.ac&&c.ac.defog,     confirm:false},
+  {k:'defrostOff',     lbl:'Defog off',      op:'741200', cap:c=>c.ac&&c.ac.defog,     confirm:false},
+  {k:'acPurifyOn',     lbl:'Purify on',      op:'742501', cap:c=>c.ac&&c.ac.purify,    confirm:false},
+  {k:'acPurifyOff',    lbl:'Purify off',     op:'742500', cap:c=>c.ac&&c.ac.purify,    confirm:false},
+  {k:'windshieldHeatOn', lbl:'Windshield heat on',  op:'742301', cap:c=>c.windshieldHeat, confirm:false},
+  {k:'windshieldHeatOff',lbl:'Windshield heat off', op:'742300', cap:c=>c.windshieldHeat, confirm:false},
+  {k:'steerHeatOn',    lbl:'Steering heat on',  op:'742401', cap:c=>c.steerHeat, confirm:false},
+  {k:'steerHeatOff',   lbl:'Steering heat off', op:'742400', cap:c=>c.steerHeat, confirm:false},
+];
+const CTRL_SEAT_ZONES = [
+  {label:'Driver heat',     prefix:'seatHeatL',  maxKey:'heatL'},
+  {label:'Driver vent',     prefix:'seatVentL',  maxKey:'ventL'},
+  {label:'Passenger heat',  prefix:'seatHeatR',  maxKey:'heatR'},
+  {label:'Passenger vent',  prefix:'seatVentR',  maxKey:'ventR'},
+  {label:'Rear L heat',     prefix:'seatHeatLR', maxKey:'heatLR'},
+  {label:'Rear L vent',     prefix:'seatVentLR', maxKey:'ventLR'},
+  {label:'Rear R heat',     prefix:'seatHeatRR', maxKey:'heatRR'},
+  {label:'Rear R vent',     prefix:'seatVentRR', maxKey:'ventRR'},
+];
+const CTRL_CANDIDATES=["740100","740200","740300","740400","740500","740600","740700","740800","740A00","740E00","740F00","740F01","740F02","741000","741001","741200","741201","741500","741501","741502","741503","741600","741601","741602","741603","741700","741701","741702","741703","741900","741901","741902","741903","741A00","741A01","741A02","741A03","741B00","741B01","741B02","741B03","741C00","741C01","741C02","741C03","741E00","741E01","741E02","741E03","741F00","741F01","742000","742001","742300","742301","742400","742401","742500","742501","742600","742602","742701"];
+let CTRL_CAPS=null, CTRL_KNOWN=[], CTRL_OPCODES={}, CTRL_OP_VER=null;
+function ctrlMap(){
   if(CTRL_OPCODES && Object.keys(CTRL_OPCODES).length) return CTRL_OPCODES;
   try{return JSON.parse(localStorage.getItem('ctrlMap')||'{}');}catch(e){return {};} }
 async function ctrlSetOp(k,op){
@@ -1643,46 +1679,91 @@ async function fireOpcode(op,to){
       body:JSON.stringify({data:op,timeOut:parseInt(to)||20})});
     const d=await r.json();
     if(d.ok) ctrlLog('&#10003; '+op+' ok');
-    else if(String(d.code)==='50043') ctrlLog('&#10007; '+op+' &mdash; car unreachable (asleep / weak signal &mdash; use Bluetooth)');
+    else if(String(d.code)==='50043') ctrlLog('&#10007; '+op+' &mdash; car unreachable (asleep / weak signal)');
     else ctrlLog('&#10007; '+op+' &mdash; '+(d.msg||d.error||d.code||'failed'));
-    setTimeout(()=>load(),1500);   // pull fresh status after a command
+    setTimeout(()=>load(),1500);
     return d;
   }catch(e){ ctrlLog('&#10007; '+op+' &mdash; '+e); }
+}
+async function fireNamed(code, confirmLbl, needConfirm){
+  if(!code) return;
+  if(needConfirm && !confirm(confirmLbl+' — send now?')) return;
+  await fireOpcode('77',20); await new Promise(r=>setTimeout(r,600)); await fireOpcode(code,20);
+}
+function makeCtrlBtn(a, grid){
+  const map=ctrlMap(), op=map[a.k]||a.op||'';
+  const b=document.createElement('button'); b.className='ctrlbtn'+(op?'':' unset');
+  b.innerHTML='<span>'+a.lbl+'</span><small>'+(op?op:'tap to set')+'</small>';
+  b.addEventListener('click',async()=>{
+    const code=ctrlMap()[a.k]||a.op;
+    if(!code){ const nv=(prompt('Opcode (hex) for "'+a.lbl+'"','')||'').trim(); if(!nv) return; await ctrlSetOp(a.k,nv); renderControls(); return; }
+    b.classList.add('busy');
+    try{ await fireNamed(code, a.lbl, a.confirm); }
+    finally{ b.classList.remove('busy'); }
+  });
+  let lp; b.addEventListener('pointerdown',()=>{ lp=setTimeout(async()=>{ const nv=prompt('Opcode for "'+a.lbl+'"',ctrlMap()[a.k]||a.op||''); if(nv!==null){ await ctrlSetOp(a.k,nv.trim()); renderControls(); } },600); });
+  ['pointerup','pointerleave','pointercancel'].forEach(ev=>b.addEventListener(ev,()=>clearTimeout(lp)));
+  grid.appendChild(b);
 }
 function renderControls(){
   const caps=CTRL_CAPS; if(!caps||!$('ctrlGrid')) return;
   $('ctrlBadge').textContent = caps.plate || (DATA.vehicle&&DATA.vehicle.model) || '—';
-  const map=ctrlMap(), grid=$('ctrlGrid'); grid.innerHTML='';
-  CTRL_ACTIONS.filter(a=>{ try{return a.cap(caps);}catch(e){return false;} }).forEach(a=>{
-    const op=map[a.k]||a.op||'';                    // localStorage override wins, else the decoded default
-    const b=document.createElement('button'); b.className='ctrlbtn'+(op?'':' unset');
-    b.innerHTML='<span>'+a.lbl+'</span><small>'+(op?op:'tap to set')+'</small>';
-    b.addEventListener('click',async()=>{
-      const code=ctrlMap()[a.k]||a.op;
-      if(!code){ const nv=(prompt('Opcode (hex) for "'+a.lbl+'"','')||'').trim(); if(!nv) return; await ctrlSetOp(a.k,nv); renderControls(); return; }
-      if(a.confirm && !confirm(a.lbl+' — send now?')) return;
-      b.classList.add('busy');
-      try{ await fireOpcode('77',20); await new Promise(r=>setTimeout(r,600)); await fireOpcode(code,20); }
-      finally{ b.classList.remove('busy'); }
+  const grid=$('ctrlGrid'); grid.innerHTML='';
+  CTRL_PRIMARY.filter(a=>{ try{return a.cap(caps);}catch(e){return false;} }).forEach(a=>makeCtrlBtn(a, grid));
+  const cg=$('ctrlClimateGrid'), cwrap=$('ctrlClimateExtras');
+  if(cg && cwrap){
+    cg.innerHTML='';
+    const climate=CTRL_CLIMATE.filter(a=>{ try{return a.cap(caps);}catch(e){return false;} });
+    cwrap.style.display=climate.length?'':'none';
+    climate.forEach(a=>makeCtrlBtn(a, cg));
+  }
+  const seats=caps.seats||{}, swrap=$('ctrlSeats'), srows=$('ctrlSeatRows');
+  if(swrap && srows){
+    srows.innerHTML='';
+    let any=false;
+    CTRL_SEAT_ZONES.forEach(z=>{
+      const max=seats[z.maxKey]|0; if(max<=0) return;
+      any=true;
+      const lab=document.createElement('label');
+      lab.innerHTML='<span>'+z.label+'</span>';
+      const sel=document.createElement('select');
+      sel.innerHTML='<option value="0">Off</option>';
+      for(let i=1;i<=max;i++){ const o=document.createElement('option'); o.value=String(i); o.textContent='L'+i; sel.appendChild(o); }
+      sel.addEventListener('change',async()=>{
+        const lvl=parseInt(sel.value,10)||0;
+        const ak = lvl<=0 ? z.prefix+'Off' : z.prefix+String(lvl);
+        const code = ctrlMap()[ak];
+        if(!code){ ctrlLog('no opcode for '+ak); return; }
+        sel.disabled=true;
+        try{ await fireNamed(code, z.label+(lvl?(' L'+lvl):' off'), false); }
+        finally{ sel.disabled=false; }
+      });
+      lab.appendChild(sel); srows.appendChild(lab);
     });
-    let lp; b.addEventListener('pointerdown',()=>{ lp=setTimeout(async()=>{ const nv=prompt('Opcode for "'+a.lbl+'" (mismatch? fix it here)',ctrlMap()[a.k]||a.op||''); if(nv!==null){ await ctrlSetOp(a.k,nv.trim()); renderControls(); } },600); });
-    ['pointerup','pointerleave','pointercancel'].forEach(ev=>b.addEventListener(ev,()=>clearTimeout(lp)));
-    grid.appendChild(b);
-  });
-  const kn=$('ctrlKnown'); if(kn){ kn.innerHTML='Init opcodes (0x23/0x24/0x77 &mdash; handshake, no actuation): ';
+    swrap.style.display=any?'':'none';
+  }
+  const kn=$('ctrlKnown'); if(kn){ kn.innerHTML='Init opcodes (0x23/0x24/0x77): ';
     (CTRL_KNOWN||[]).forEach(o=>{ const s=document.createElement('button'); s.className='chipbtn';
       s.textContent=o.code; s.title=o.note||''; s.addEventListener('click',()=>fireOpcode(o.code,20)); kn.appendChild(s); }); }
-  const sc=$('ctrlScan'); if(sc){ sc.innerHTML='Decoded opcodes (74&lt;cmd&gt;&lt;state&gt;; 742701=stop charge). Tap = init 77 then fire &mdash; WATCH the car: ';
+  const sc=$('ctrlScan'); if(sc){ sc.innerHTML='Blutter opcodes (init 77 then fire): ';
     CTRL_CANDIDATES.forEach(code=>{ const s=document.createElement('button'); s.className='chipbtn';
       s.textContent=code; s.addEventListener('click',async()=>{ ctrlLog('init 77 &rarr; '+code); await fireOpcode('77',20); await new Promise(r=>setTimeout(r,600)); await fireOpcode(code,20); }); sc.appendChild(s); }); }
   const ac=caps.ac||{}; $('ctrlAc').style.display=(ac.temp)?'':'none';
-  if(ac.temp){ const sl=$('ctrlAcSlider'); sl.min=Math.round((ac.min||16)*10); sl.max=Math.round((ac.max||30)*10);
-    sl.step=Math.round((ac.step||0.5)*10); const upd=()=>$('ctrlAcTemp').textContent=(sl.value/10).toFixed(1); sl.oninput=upd; upd(); }
+  if(ac.temp){ const sl=$('ctrlAcSlider'); sl.min=Math.round((ac.min||16)*10); sl.max=Math.round((ac.max||31)*10);
+    sl.step=Math.round((ac.step||1)*10); const upd=()=>$('ctrlAcTemp').textContent=(sl.value/10).toFixed(1); sl.oninput=upd; upd(); }
 }
 async function loadControls(){
   try{ const r=await fetch('api/controls'); const d=await r.json();
     if(d && d.caps){ CTRL_CAPS=d.caps; CTRL_KNOWN=d.known||[];
-      if(d.opcodes){ CTRL_OPCODES=d.opcodes; try{ localStorage.setItem('ctrlMap',JSON.stringify(d.opcodes)); }catch(e){} }
+      const ver = d.opcodes_version!=null ? String(d.opcodes_version) : null;
+      if(d.opcodes){
+        CTRL_OPCODES=d.opcodes;
+        try{
+          localStorage.setItem('ctrlMap',JSON.stringify(d.opcodes));
+          if(ver) localStorage.setItem('ctrlMapVersion',ver);
+        }catch(e){}
+        CTRL_OP_VER=ver;
+      }
       renderControls(); } }catch(e){}
 }
 const SHEETS={battery:bBattery,rpkm:bRpkm,forecast:bForecast,range:bRange,health:bHealth,eff:bEff,charge:bCharge,tyres:bTyres,odo:bOdo,volt:bVolt,speed:bSpeed,life:bLife,care:bCare,spec:bSpec};
@@ -1986,6 +2067,17 @@ setupTabs();
 bindStatic();                                          // make cards/stats tappable
 // control tab wiring
 if($('ctrlFire')) $('ctrlFire').addEventListener('click',()=>fireOpcode($('ctrlOp').value,$('ctrlTo').value));
+if($('ctrlAcSend')) $('ctrlAcSend').addEventListener('click',async()=>{
+  const c=($('ctrlAcSlider').value/10);
+  try{
+    const r=await fetch('api/ac-temp-opcode?c='+encodeURIComponent(c));
+    const d=await r.json();
+    if(!d.opcode){ ctrlLog('bad temp opcode'); return; }
+    $('ctrlAcSend').disabled=true;
+    try{ await fireNamed(d.opcode, 'A/C '+c+'°C', false); }
+    finally{ $('ctrlAcSend').disabled=false; }
+  }catch(e){ ctrlLog('temp set failed: '+e); }
+});
 if($('ctrlDiscToggle')) $('ctrlDiscToggle').addEventListener('click',()=>{ const d=$('ctrlDisc'); d.style.display=d.style.display==='none'?'':'none'; });
 loadControls();                                        // fetch what this car supports + opcodes to test
 loadMqtt();                                            // MQTT bridge settings + status

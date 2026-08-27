@@ -4,8 +4,9 @@ Stores the RAW blob every poll so fields decoded later (odometer, charge flag, t
 be back-filled from history.
 
 Usage:
-  python logger.py            # single poll (good for Windows Task Scheduler)
-  python logger.py --loop 600 # poll every 600s forever (Ctrl-C to stop)
+  python logger.py                # single poll (good for Windows Task Scheduler)
+  python logger.py --loop 600     # poll every 600s forever (Ctrl-C to stop)
+  python logger.py --stream       # persistent WS socket, push-driven (recommended)
 """
 import sys, json, time, sqlite3, argparse, os, socket
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -83,6 +84,12 @@ def reload_config():
     if os.path.exists(_TOKEN_FILE):
         TOKEN = open(_TOKEN_FILE).read().strip() or TOKEN
 
+def ws_send(ws, obj):
+    ws.send(json.dumps(obj))
+
+def ws_recv(ws):
+    return ws.recv()
+
 def poll_once(conn, _retried=False):
     global TOKEN
     if not _retried:
@@ -90,8 +97,8 @@ def poll_once(conn, _retried=False):
         conn.executescript(SCHEMA)          # idempotent: ensure the table exists for any caller
     ws = connect()
     try:
-        ws.send(json.dumps({"action": 1, "data": {"token": TOKEN, "vehicleId": VEHICLE}}))
-        login = json.loads(ws.recv())
+        ws_send(ws, {"action": 1, "data": {"token": TOKEN, "vehicleId": VEHICLE}})
+        login = json.loads(ws_recv(ws))
         if login.get("code") != "0000":
             try: ws.close()
             except Exception: pass
@@ -107,14 +114,14 @@ def poll_once(conn, _retried=False):
                     return None
             print("LOGIN FAILED after refresh:", login)
             return None
-        ws.send(json.dumps({"action": 6}))
-        ws.send(json.dumps({"action": 0, "data": {"sn": SN}}))
+        ws_send(ws, {"action": 6})
+        ws_send(ws, {"action": 0, "data": {"sn": SN}})
         blob = None
         ws.settimeout(8)
         t_end = time.time() + 10
         while time.time() < t_end:
             try:
-                j = json.loads(ws.recv())
+                j = json.loads(ws_recv(ws))
             except Exception:
                 break
             if j.get("action") == 6 and isinstance(j.get("data"), str):
@@ -227,29 +234,29 @@ def _stream_session(conn):
     reload_config()
     ws = connect()
     try:
-        ws.send(json.dumps({"action": 1, "data": {"token": TOKEN, "vehicleId": VEHICLE}}))
-        login = json.loads(ws.recv())
+        ws_send(ws, {"action": 1, "data": {"token": TOKEN, "vehicleId": VEHICLE}})
+        login = json.loads(ws_recv(ws))
         if login.get("code") != "0000":                    # token expired -> self-login, as poll_once does
             print(f"token invalid ({login.get('code')}); self-logging in...")
             import auth
             TOKEN = auth.login()
-            ws.send(json.dumps({"action": 1, "data": {"token": TOKEN, "vehicleId": VEHICLE}}))
-            login = json.loads(ws.recv())
+            ws_send(ws, {"action": 1, "data": {"token": TOKEN, "vehicleId": VEHICLE}})
+            login = json.loads(ws_recv(ws))
             if login.get("code") != "0000":
                 print("LOGIN FAILED after refresh:", login); return
-        ws.send(json.dumps({"action": 6}))                 # prime: pull the current frame immediately
-        ws.send(json.dumps({"action": 0, "data": {"sn": SN}}))
+        ws_send(ws, {"action": 6})                 # prime: pull the current frame immediately
+        ws_send(ws, {"action": 0, "data": {"sn": SN}})
         ws.settimeout(2)
         last_hb = last_req = last_store = time.time()
         last_blob = None
         while True:
             now = time.time()
             if now - last_hb >= HEARTBEAT:
-                ws.send(json.dumps({"action": 0, "data": {"sn": SN}})); last_hb = now
+                ws_send(ws, {"action": 0, "data": {"sn": SN}}); last_hb = now
             if now - last_req >= STREAM_BACKSTOP:
-                ws.send(json.dumps({"action": 6})); last_req = now
+                ws_send(ws, {"action": 6}); last_req = now
             try:
-                msg = ws.recv()
+                msg = ws_recv(ws)
             except websocket.WebSocketTimeoutException:
                 if last_blob and time.time() - last_store >= TOUCH:   # keep the freshness stamp live
                     _store_blob(conn, last_blob); last_store = time.time()

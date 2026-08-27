@@ -175,8 +175,32 @@ def control_caps():
         except Exception: cfg = {}
     cfg = cfg or {}
     ac = cfg.get("A/C") or {}
+
+    def _levels(lst):
+        """LeftHeaterList etc. = [L1,L2,L3] bools → max level 0..3."""
+        if not isinstance(lst, list):
+            return 0
+        n = 0
+        for i, on in enumerate(lst[:3]):
+            if on:
+                n = i + 1
+        return n
+
+    seats = {
+        "heatL": _levels(ac.get("LeftHeaterList")) if ac.get("DriverHeater") else 0,
+        "ventL": _levels(ac.get("LeftVentList")) if ac.get("DriverVent") else 0,
+        "heatR": _levels(ac.get("RightHeaterList")) if ac.get("AssistantHeater") else 0,
+        "ventR": _levels(ac.get("RightVentList")) if ac.get("AssistantVent") else 0,
+        "heatLR": _levels(ac.get("RearHeaterList")) if ac.get("RearHeater") else 0,
+        "ventLR": _levels(ac.get("RearVentList")) if ac.get("RearVent") else 0,
+        # Passenger rear often shares Rear* lists; expose RR only when rear lists exist and passenger side is on.
+        "heatRR": _levels(ac.get("RearHeaterList")) if ac.get("RearHeater") else 0,
+        "ventRR": _levels(ac.get("RearVentList")) if ac.get("RearVent") else 0,
+    }
     return {
         "lock":     bool(cfg.get("Lock")),
+        "engine":   bool(cfg.get("Engine")),
+        "gear":     bool(ac.get("HighLowGear")),
         "windows":  {"open": bool(cfg.get("WindowsOpen")), "close": bool(cfg.get("WindowsClose")),
                      "vent": bool(cfg.get("WindowsVent"))},
         "sunroof":  {"open": bool(cfg.get("Sunroof")), "tilt": bool(cfg.get("SunroofTilting"))},
@@ -184,10 +208,14 @@ def control_caps():
         "trunk":    bool(cfg.get("Trunk")),
         "find":     bool(cfg.get("Search")),
         "charging": bool(cfg.get("ChargingManagement")),
+        "windshieldHeat": bool(cfg.get("FrontWindshieldHeater")),
+        "steerHeat": bool(cfg.get("SteeringWheelHeater")),
         "ac": {"switch": bool(ac.get("Switch")), "temp": bool(ac.get("SetTemperature")),
                "min": ac.get("SetTemperatureMin"), "max": ac.get("SetTemperatureMax"),
                "step": ac.get("TemperatureStepValue"), "rapidCool": bool(ac.get("RapidCool")),
-               "rapidHeat": bool(ac.get("RapidHeat")), "defog": bool(ac.get("Defogging"))},
+               "rapidHeat": bool(ac.get("RapidHeat")), "defog": bool(ac.get("Defogging")),
+               "purify": bool(ac.get("AirPurification"))},
+        "seats": seats,
         "plate": v.get("licenseNumber") or "",
     }
 
@@ -331,6 +359,8 @@ def decode(hexstr):
         d["windows"] = b[8]                                 # 2 bits per window: closed/open bits,
                                                             # both clear = partial (E5, #5)
         d["sunroof_open"] = bool(b[9])                      # 0 = fully closed (E5, #5)
+        # Byte 26: correlated with remote engine/power on-off on OMODA 9 (candidate "engine on").
+        d["engine_on"] = bool(b[26]) if len(b) > 26 else None
         d["ac_temp_c"] = b[24] if b[24] else None           # A/C target temp, raw degC (E5, #5);
                                                             # the J5 reads 159-169 here -> model-specific
         d["seat_heat"] = [b[32], b[33]]                     # L, R (0 = off)
@@ -846,7 +876,7 @@ def demo_summary():
         "online": True, "battery": 72, "range_km": 318, "odometer": 8421, "volt12": 13.6,
         "unlocked": False, "speed": None, "moving": False, "avg_speed": 41,
         "ac_on": False, "ac_temp_c": 22, "doors": 0, "trunk_open": False,
-        "windows": 0, "sunroof_open": False,
+        "windows": 0, "sunroof_open": False, "engine_on": False,
         "seat_heat": [0, 0], "seat_vent": [0, 0], "defrost_front": False, "hv_state": 0,
         "updated": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now - 180)),
         "updated_ts": int(now - 180), "age_min": 3.0,
@@ -914,7 +944,7 @@ def _build_summary():
     out = {"vehicle": VEHICLE, "online": False, "battery": None, "range_km": None,
            "odometer": None, "volt12": None, "unlocked": None, "speed": None,
            "ac_on": None, "ac_temp_c": None, "doors": None, "trunk_open": None,
-           "windows": None, "sunroof_open": None,
+           "windows": None, "sunroof_open": None, "engine_on": None,
            "seat_heat": None, "seat_vent": None, "defrost_front": None, "hv_state": None,
            "moving": False, "avg_speed": None, "insights": {}, "health": {}, "drain": None,
            "volt12_min7d": None, "volt12_status": None,
@@ -957,6 +987,7 @@ def _build_summary():
     # Body / climate bytes (decoded in decode(); lock verified on J5+E5, A/C+doors+windows
     # live-verified on E5 #5 — surfaced for REST + MQTT so HA can use real state).
     out["ac_on"] = bool(dec.get("ac_on"))
+    out["engine_on"] = bool(dec.get("engine_on")) if dec.get("engine_on") is not None else None
     out["doors"] = dec.get("doors")
     out["trunk_open"] = bool(dec.get("trunk_open")) if dec.get("trunk_open") is not None else None
     out["windows"] = dec.get("windows")
@@ -1516,10 +1547,26 @@ class H(BaseHTTPRequestHandler):
             try:
                 import mqtt_bridge as MB
                 self._send(200, json.dumps({"caps": control_caps(), "known": KNOWN_OPCODES,
-                                            "opcodes": MB.load_opcodes()}).encode(),
+                                            "opcodes": MB.load_opcodes(),
+                                            "opcodes_version": MB.opcodes_version()}).encode(),
                            "application/json")
             except Exception as e:
                 self._send(200, json.dumps({"error": str(e)[:180]}).encode(), "application/json")
+            return
+        if path == "/api/ac-temp-opcode":
+            # GET ?c=22 → {"opcode":"741116"} for Control tab / debugging
+            if not self._authed():
+                self._send(401, b'{"error":"auth"}', "application/json"); return
+            try:
+                import mqtt_bridge as MB
+                from urllib.parse import parse_qs, urlparse
+                q = parse_qs(urlparse(self.path).query)
+                c = (q.get("c") or q.get("temp") or [None])[0]
+                op = MB.build_ac_temp_opcode(c)
+                self._send(200, json.dumps({"opcode": op, "celsius": float(c) if c is not None else None}).encode(),
+                           "application/json")
+            except Exception as e:
+                self._send(400, json.dumps({"error": str(e)[:180]}).encode(), "application/json")
             return
         if path == "/api/mqtt":                        # MQTT bridge config + status (password redacted)
             if not self._authed():
@@ -1833,7 +1880,8 @@ class H(BaseHTTPRequestHandler):
                 import mqtt_bridge as MB
                 mapping = body.get("opcodes") if isinstance(body.get("opcodes"), dict) else body
                 ops = MB.save_opcodes(mapping)
-                self._send(200, json.dumps({"ok": True, "opcodes": ops}).encode(),
+                self._send(200, json.dumps({"ok": True, "opcodes": ops,
+                                            "opcodes_version": MB.opcodes_version()}).encode(),
                            "application/json")
             except Exception as e:
                 self._send(200, json.dumps({"ok": False, "error": str(e)[:180]}).encode(),

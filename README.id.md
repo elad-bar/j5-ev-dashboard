@@ -67,12 +67,10 @@ sendiri**. Disediakan untuk keperluan edukasi & pribadi.
   orang lain (yang bisa membuka/mengontrol mobil mereka) dan hampir pasti melanggar ketentuan
   vendor. Deployment yang dimaksud adalah **satu instance per pemilik**, self-hosted, privat
   (mis. di belakang Tailscale). Lihat [Menuju multi-user](#menuju-multi-user).
-- Sebagian besar read-only. Tab Control **sudah ada** (kunci, A/C, jendela, sunroof, bagasi,
-  find-car, stop charging), tapi statusnya **beta**: cuma *Stop charging* yang opcode-nya
-  terkonfirmasi, sisanya hasil decode best-effort dari APK, dan tiap tap itu **aksi nyata di mobil
-  nyata** — perhatikan mobilnya waktu dipakai. Juga **cloud-only: belum bisa Bluetooth.** Kontrol
-  Bluetooth-proximity yang ada di app CarLinko **tidak** diimplementasikan, jadi mobil harus bangun
-  dan punya sinyal seluler; kalau tidak, command-nya gagal (`50043`).
+- Sebagian besar read-only. Tab Control **sudah ada** (kunci, engine, A/C, jendela, sunroof, bagasi,
+  kursi, find-car, stop charging, …) pakai peta opcode Blutter (**A/C on/off** dan **stop charging**
+  terkonfirmasi live; label lain tetap watch-the-car). Tiap tap **aksi nyata** — long-press untuk
+  remap. **Cloud-only: belum Bluetooth.** Mobil harus bangun + sinyal seluler, atau gagal (`50043`).
 
 Kalau ga setuju sama poin di atas, jangan dipakai.
 
@@ -92,11 +90,10 @@ Kalau ga setuju sama poin di atas, jangan dipakai.
   live dari Google.
 - **Peta SPKLU** — geser peta interaktif, ketuk charger untuk konektor, ketersediaan live, dan
   petunjuk arah (gaya PLN Mobile), data dari Google Places.
-- **Kontrol jarak jauh (beta)** — tab Control yang menembakkan opcode asli `74<cmd><state>` ke
-  mobil: kunci/buka, A/C on/off + suhu target, jendela, sunroof, bagasi, find-car, stop charging.
-  Hanya *stop charging* yang terkonfirmasi; sisanya label best-effort yang bisa kamu remap dengan
-  long-press tombolnya. **Cloud-only — belum bisa Bluetooth.** Lihat
-  [docs/control-opcodes.md](docs/control-opcodes.md).
+- **Kontrol jarak jauh (beta)** — tab Control / MQTT menembakkan opcode `74<cmd><state>` (peta
+  Blutter): kunci, engine, A/C + suhu, jendela, sunroof, bagasi, kursi, find-car, stop charging, ….
+  **A/C on/off** dan **stop charging** terkonfirmasi live; long-press untuk remap. **Cloud-only —
+  belum Bluetooth.** Lihat [docs/control-opcodes.md](docs/control-opcodes.md).
 - **Perawatan baterai, hitung mundur servis, tampilan ban, toggle privasi, dark mode, i18n EN/ID.**
 - **Home Assistant** — MQTT discovery atau REST sensor; event batre-low / charge-selesai. Lihat [docs/HOMEASSISTANT.md](docs/HOMEASSISTANT.md).
 
